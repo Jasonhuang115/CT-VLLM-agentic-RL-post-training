@@ -45,8 +45,9 @@ def unfreeze_vision_p2(model, vit_layers: int = 2):
         merger_names = [n for n in visual_names if "block" not in n.lower()]
     for n, p in model.named_parameters():
         if any(m in n for m in merger_names[:3]):  # 前3个作为模式匹配
-            p.requires_grad = True
-            vit_params.add(n)
+            if p.dtype in (torch.float32, torch.float16, torch.bfloat16):
+                p.requires_grad = True
+                vit_params.add(n)
     print(f"[VISION] Projector/merger unfrozen: {len([n for n in vit_params if 'merger' in n.lower() or 'block' not in n.lower()])} params")
 
     # 3. 解冻 ViT 最后 N 层
@@ -65,8 +66,9 @@ def unfreeze_vision_p2(model, vit_layers: int = 2):
             for n, p in model.named_parameters():
                 for lid in last_n:
                     if f".{lid}." in n or f"blocks.{lid}" in n or f"layers.{lid}" in n:
-                        p.requires_grad = True
-                        vit_params.add(n)
+                        if p.dtype in (torch.float32, torch.float16, torch.bfloat16):
+                            p.requires_grad = True
+                            vit_params.add(n)
                         break
 
     vit_count = len(vit_params)

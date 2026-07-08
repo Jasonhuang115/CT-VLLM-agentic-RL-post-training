@@ -1,0 +1,78 @@
+# GRPO 奖励函数配置
+# 参考 MedFact-R1 (2025) 五信号设计
+
+rewards:
+  format:
+    weight: 0.10
+    description: "结构化格式检查"
+    checks:
+      - "包含'影像学发现'或'Findings'段落"
+      - "包含'恶性风险评估'或'Assessment'段落"
+      - "包含'随访建议'或'Recommendation'段落"
+      - "包含免责声明"
+      - "整体结构清晰, 有分段标题"
+    score_per_check: 0.2  # 总分 = 通过的check数 * score_per_check
+
+  accuracy:
+    weight: 0.30
+    description: "关键数值准确性"
+    metrics:
+      size_deviation_pct:  # 直径误差
+        range: [0, 10, 20, 50, 100]  # % 误差
+        scores: [1.0, 0.8, 0.5, 0.2, 0.0]  # 对应分数
+      position_accuracy:  # 肺叶定位
+        exact_match: 1.0
+        adjacent_lobe: 0.5
+        wrong_lung: 0.0
+      malignancy_match:
+        exact: 1.0
+        adjacent_level: 0.6  # ±1 级
+        wrong: 0.0
+
+  factual:
+    weight: 0.35
+    description: "事实性描述质量"
+    metrics:
+      density_type_match: 1.0  # 实性/部分实性/磨玻璃 必须对
+      calcification_match: 0.8
+      margin_description: 0.6  # 边界描述合理
+      spiculation_present: 0.7  # 毛刺特征描述
+
+  completeness:
+    weight: 0.15
+    description: "信息完整性"
+    required_fields:
+      - "位置"    # score_per_field = 1/len(required_fields)
+      - "大小"
+      - "形态类型"
+      - "密度特征"
+      - "钙化状态"
+      - "边界特征"
+      - "Lung-RADS分级"
+      - "随访建议"
+
+  consistency:
+    weight: 0.10
+    description: "自洽性检查"
+    checks:
+      - "大小数据前后一致"
+      - "密度类型与Lung-RADS分级不自相矛盾"
+      - "恶性评估与随访建议匹配"
+      - "不出现大段重复/乱码"
+
+# 防策略坍缩
+anti_collapse:
+  min_output_length: 100       # 少于100字符 → 负奖励
+  min_output_penalty: -0.2
+  no_finding_patterns:          # "未见异常" 模式检测
+    - "no .*finding"
+    - "no .*abnormality"
+    - "未见.*异常"
+    - "未见.*结节"
+  no_finding_penalty: -0.5
+
+# 动态难度
+dynamic_sampling:
+  enabled: true
+  update_interval_steps: 100
+  hard_sample_ratio: 0.3  # 30% 高loss样本

@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data (large binary files)
+*.raw
+*.mhd
+*.zip
+*.dcm
+*.nii
+*.nii.gz
+data/download/
+
+# Models / checkpoints
+outputs/
+*.bin
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+
+# Logs
+*.log
+wandb/
+lightning_logs/
+
+# Environment
+.env
+.env.local
+
+# Jupyter
+.ipynb_checkpoints/
+
+# AutoDL
+autodl-tmp/

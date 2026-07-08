@@ -1,0 +1,61 @@
+# Core ML
+torch>=2.4.0
+torchvision>=0.19.0
+transformers>=4.51.0
+accelerate>=1.3.0
+peft>=0.14.0
+bitsandbytes>=0.45.0
+xformers>=0.0.28.post3
+
+# Training frameworks
+trl>=0.18.0
+unsloth>=2025.6.0
+datasets>=3.2.0
+
+# Inference engine (for GRPO rollouts)
+vllm>=0.7.0
+
+# Distributed training (fallback)
+deepspeed>=0.16.0
+
+# Medical imaging
+pydicom>=3.0.0
+nibabel>=5.3.0
+opencv-python-headless>=4.10.0
+scikit-image>=0.24.0
+SimpleITK>=2.4.0
+
+# Image processing
+Pillow>=10.0.0
+imageio>=2.36.0
+matplotlib>=3.8.0
+seaborn>=0.13.0
+
+# Data processing
+pandas>=2.2.0
+numpy>=1.26.0
+tqdm>=4.66.0
+pyarrow>=18.0.0
+huggingface_hub>=0.28.0
+
+# Agent framework
+langchain>=0.3.0
+langgraph>=0.2.0
+tavily-python>=0.5.0
+
+# Evaluation
+scikit-learn>=1.5.0
+nltk>=3.9.0
+rouge-score>=0.1.2
+
+# Web demo
+gradio>=5.0.0
+
+# Config
+pyyaml>=6.0
+omegaconf>=2.3.0
+
+# Utilities
+wandb>=0.18.0
+rich>=13.0.0
+fire>=0.6.0

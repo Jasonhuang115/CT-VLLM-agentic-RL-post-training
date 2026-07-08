@@ -1,0 +1,83 @@
+# 数据集路径和预处理参数
+paths:
+  data_root: "/root/autodl-tmp/data"
+  model_root: "/root/autodl-tmp/models"
+  output_root: "/root/autodl-tmp/outputs"
+
+datasets:
+  luna16:
+    download_dir: "/root/autodl-tmp/data/LUNA16"
+    url: "https://zenodo.org/records/3723295"
+    n_scans: 888
+    n_nodules: 1186
+    format: ".mhd/.raw (MetaImage) + annotations.csv"
+    license: "CC BY 4.0"
+    note: "LIDC-IDRI筛选后, 开箱即用, 论文标准"
+
+  ctrate:
+    download_dir: "/root/autodl-tmp/data/CT-RATE"
+    hf_repo: "ibrahimhamamci/CT-RATE"
+    n_volumes: 25692
+    n_abnormal_labels: 18
+    configs: ["reports", "labels"]
+    license: "需申请Gated Access"
+    note: "21TB全量, 我们只下报告文本(~2-3GB)"
+
+  totalsegmentator:
+    download_dir: "/root/autodl-tmp/data/TotalSegmentator"
+    url: "https://zenodo.org/records/6802613"
+    n_volumes: 1228
+    n_organs: 117
+    format: "NIfTI + organ masks"
+    license: "CC BY 4.0"
+
+preprocessing:
+  ct_window:
+    lung:
+      level: -600
+      width: 1500
+    mediastinal:
+      level: 50
+      width: 350
+
+  nodule_roi:
+    margin_mm: 10
+    min_size_px: 32
+    max_size_px: 512
+
+  multi_view:
+    enable: true
+    views:
+      - "axial_center"
+      - "coronal"
+      - "sagittal"
+      - "montage_3x3"
+      - "mip_thumbnail"
+
+  output_size: [512, 512]
+  output_format: "png"
+
+train_val_split:
+  method: "patient_level"
+  ratios: [0.7, 0.15, 0.15]
+  seed: 42
+
+sft_data:
+  n_total: 15000
+  n_lidc_reports: 8000   # LIDC → DeepSeek 润色报告
+  n_radgenome_reports: 5000  # RadGenome 标准化报告
+  n_chinese_translated: 2000  # DeepSeek 中文翻译子集
+  instruction_variants_per_sample: 3  # DeepSeek 生成的指令变体
+
+dpo_data:
+  n_pairs: 5000
+  chosen_source: "LIDC ground truth + DeepSeek 润色"
+  rejected_source: "随机数值扰动 + SFT低分生成 + DeepSeek评分过滤"
+
+agent_data:
+  n_trajectories: 2000
+  teacher_model: "deepseek-v4-pro"
+  trajectory_types:
+    - "单工具调用（指南检索为主）"
+    - "多工具组合（指南+搜索+计算）"
+    - "工具失败回退（结果不可用时的处理）"

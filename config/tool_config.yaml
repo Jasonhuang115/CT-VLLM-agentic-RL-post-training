@@ -1,0 +1,73 @@
+# Agent 工具集配置
+
+tools:
+  web_search:
+    name: "web_search"
+    description: "搜索最新医学文献、PubMed摘要和临床研究"
+    backend: "duckduckgo"
+    max_results: 5
+    timeout_seconds: 10
+    rate_limit_per_minute: 5
+
+  guideline_retrieval:
+    name: "guideline_retrieval"
+    description: "从本地临床指南知识库检索相关内容"
+    backend: "local_rag"
+    knowledge_base:
+      # 肺结节相关指南 (中英文)
+      - name: "Fleischner Society 2017"
+        file: "guidelines/fleischner_2017.txt"
+        description: "肺结节管理指南 (国际标准)"
+      - name: "Lung-RADS v2022"
+        file: "guidelines/lung_rads_v2022.txt"
+        description: "ACR肺结节报告与数据系统"
+      - name: "NCCN Lung Cancer Screening v2024"
+        file: "guidelines/nccn_lcs_2024.txt"
+        description: "NCCN肺癌筛查指南"
+      - name: "中国肺结节诊疗共识 2024"
+        file: "guidelines/china_nodule_consensus_2024.txt"
+        description: "中国肺癌筛查与早诊早治指南"
+      - name: "ACCP Lung Cancer Guidelines"
+        file: "guidelines/accp_lung_2022.txt"
+        description: "美国胸科医师学会肺癌指南"
+
+    retrieval:
+      method: "bm25"          # 或 "embedding"
+      top_k: 3
+      chunk_size: 500
+      chunk_overlap: 100
+      # embedding_model: "BAAI/bge-small-zh-v1.5"  (如果使用向量检索)
+
+  measurement_calculator:
+    name: "measurement_calculator"
+    description: "计算结节相关临床指标"
+    functions:
+      - name: "lung_rads_classification"
+        description: "根据结节类型和大小计算Lung-RADS分级"
+        inputs: ["nodule_type", "size_mm", "growth_flag"]
+      - name: "volume_doubling_time"
+        description: "计算结节体积倍增时间(VTD)"
+        inputs: ["diameter1_mm", "diameter2_mm", "interval_days"]
+      - name: "malignancy_probability"
+        description: "基于梅奥模型/VA模型计算恶性概率"
+        inputs: ["diameter_mm", "location", "spiculation", "age", "smoking_history"]
+
+  image_reanalyzer:
+    name: "image_reanalyzer"
+    description: "对CT结节区域进行定量图像分析 (纯CV实现)"
+    analysis_types:
+      density:
+        description: "HU值统计分析"
+        outputs: ["mean_hu", "std_hu", "min_hu", "max_hu", "solid_component_pct"]
+      texture:
+        description: "纹理特征分析 (GLCM/LBP)"
+        outputs: ["contrast", "homogeneity", "entropy", "correlation"]
+      boundary:
+        description: "边缘特征分析"
+        outputs: ["spiculation_index", "lobulation_index", "circularity", "fractal_dimension"]
+
+    # CV 参数
+    solid_threshold_hu: -200  # 高于此值 = 实性成分
+    ggo_threshold_hu: -700    # 低于此值 = 纯磨玻璃
+    glcm_distances: [1, 2, 4]
+    glcm_angles: [0, 45, 90, 135]

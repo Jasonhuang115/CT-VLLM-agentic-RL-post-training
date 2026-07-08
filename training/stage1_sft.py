@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
 Stage 1: SFT with FastVisionModel + Manual Training Loop
+
+P2 (PLAN.md): 解冻 vision connector + ViT 最后 N 层, 分组 LR
 """
 
 import os, sys, json, argparse
@@ -28,6 +30,51 @@ def extract_image_paths(messages: list) -> list:
     return paths
 
 
+def unfreeze_vision_p2(model, vit_layers: int = 2):
+    """P2: 解冻 vision projector + ViT 最后 N 层. 返回 vit_param_names 集合."""
+    vit_params = set()
+
+    # 1. 打印所有 visual 相关参数名 (首次运行诊断用)
+    visual_names = [n for n, _ in model.named_parameters() if "visual" in n.lower()]
+    print(f"[VISION] Found {len(visual_names)} visual parameters")
+
+    # 2. 解冻 vision-language projector/merger
+    merger_names = [n for n in visual_names if "merger" in n.lower()]
+    if not merger_names:
+        # Qwen2-VL 可能用其他名字, fallback: 所有 visual 中非 blocks 的参数
+        merger_names = [n for n in visual_names if "block" not in n.lower()]
+    for n, p in model.named_parameters():
+        if any(m in n for m in merger_names[:3]):  # 前3个作为模式匹配
+            p.requires_grad = True
+            vit_params.add(n)
+    print(f"[VISION] Projector/merger unfrozen: {len([n for n in vit_params if 'merger' in n.lower() or 'block' not in n.lower()])} params")
+
+    # 3. 解冻 ViT 最后 N 层
+    block_names = sorted([n for n in visual_names if "block" in n.lower() or "layer" in n.lower()])
+    if block_names:
+        # 提取层号
+        import re
+        layer_ids = set()
+        for bn in block_names:
+            m = re.search(r'(?:blocks?|layers?)\.(\d+)', bn)
+            if m:
+                layer_ids.add(int(m.group(1)))
+        if layer_ids:
+            last_n = sorted(layer_ids)[-vit_layers:]
+            print(f"[VISION] ViT has {len(layer_ids)} layers, unfreezing last {vit_layers}: {last_n}")
+            for n, p in model.named_parameters():
+                for lid in last_n:
+                    if f".{lid}." in n or f"blocks.{lid}" in n or f"layers.{lid}" in n:
+                        p.requires_grad = True
+                        vit_params.add(n)
+                        break
+
+    vit_count = len(vit_params)
+    vit_params_total = sum(model.get_parameter(n).numel() for n in vit_params if model.get_parameter(n) is not None)
+    print(f"[VISION] Total unfrozen: {vit_count} params, {vit_params_total/1e6:.1f}M")
+    return vit_params
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_path", default="/root/autodl-tmp/models/Qwen2.5-VL-3B-Instruct")
@@ -41,6 +88,13 @@ def main():
     parser.add_argument("--logging_steps", type=int, default=5)
     parser.add_argument("--lora_r", type=int, default=16)
     parser.add_argument("--lora_alpha", type=int, default=32)
+    # P2: Vision unfreeze
+    parser.add_argument("--unfreeze_vision", type=int, default=1,
+                        help="1=unfreeze projector+ViT last N layers, 0=all frozen (old behavior)")
+    parser.add_argument("--unfreeze_vit_layers", type=int, default=2,
+                        help="Number of ViT layers to unfreeze (default 2)")
+    parser.add_argument("--vit_lr_ratio", type=float, default=0.1,
+                        help="ViT LR = lr * vit_lr_ratio (default 0.1)")
     args = parser.parse_args()
 
     os.makedirs(args.output, exist_ok=True)
@@ -64,16 +118,34 @@ def main():
         model, finetune_vision_layers=False, finetune_language_layers=True,
         finetune_attention_modules=True, finetune_mlp_modules=True,
         r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=0.05)
+
+    # P2: 解冻 vision projector + ViT 最后 N 层
+    vit_param_names = set()
+    if args.unfreeze_vision:
+        vit_param_names = unfreeze_vision_p2(model, args.unfreeze_vit_layers)
     model.train()
 
     trainable = [p for p in model.parameters() if p.requires_grad]
-    print(f"[MODEL] Trainable: {sum(p.numel() for p in trainable):,}")
+    n_lora = sum(1 for n, p in model.named_parameters() if p.requires_grad and n not in vit_param_names)
+    n_vit = sum(1 for n, p in model.named_parameters() if p.requires_grad and n in vit_param_names)
+    print(f"[MODEL] Trainable: {sum(p.numel() for p in trainable):,} ({n_lora} LoRA + {n_vit} ViT)")
 
-    # ── 3. Optimizer ──
+    # ── 3. Optimizer (P2: 分组 LR) ──
     total_batches = len(ds["train"])
     steps_per_epoch = max(total_batches // args.grad_accum, 1)
     total_steps = steps_per_epoch * args.epochs
-    opt = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=0.01)
+
+    lora_params = [p for n, p in model.named_parameters() if p.requires_grad and n not in vit_param_names]
+    vit_params = [p for n, p in model.named_parameters() if p.requires_grad and n in vit_param_names]
+
+    if vit_params:
+        opt = torch.optim.AdamW([
+            {"params": lora_params, "lr": args.lr},
+            {"params": vit_params, "lr": args.lr * args.vit_lr_ratio},
+        ], weight_decay=0.01)
+        print(f"[OPTIM] Grouped LR — LoRA: {args.lr:.1e}, ViT: {args.lr * args.vit_lr_ratio:.1e}")
+    else:
+        opt = torch.optim.AdamW(lora_params, lr=args.lr, weight_decay=0.01)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=total_steps)
 
     print(f"[TRAIN] ~{steps_per_epoch} steps/epoch, {total_steps} total\n")

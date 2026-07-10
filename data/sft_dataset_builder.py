@@ -327,24 +327,26 @@ def call_deepseek(api_key: str, messages: list, model: str = "deepseek-chat") ->
 # 主流程
 # ═══════════════════════════════════════════════════════════════
 
-def build_sft_sample(image_paths: list, report_text: str, feats: dict, lang: str = "cn") -> dict:
-    """构建单条训练样本（OpenAI vision format + 结构化临床提示）"""
+def build_sft_sample(image_paths: list, report_text: str, feats: dict, lang: str = "cn",
+                     use_hint: bool = True) -> dict:
+    """构建单条训练样本（OpenAI vision format + 可选结构化临床提示）"""
     instruction = random.choice(INSTRUCTION_TEMPLATES_CN if lang == "cn" else INSTRUCTION_TEMPLATES_EN)
 
-    # P1: 结构化临床提示 — 注入坐标+直径锚点
+    # 特征始终从 feats 提取（metadata 需要）
     coord_x = feats.get("coordX", 0)
     coord_y = feats.get("coordY", 0)
     coord_z = feats.get("coordZ", 0)
     diameter = feats.get("diameter_mm", 10)
-    location = lobe_from_coord(coord_x, coord_y, coord_z)
 
-    if lang == "cn":
-        hint = STRUCTURED_HINT_CN.format(location=location, diameter_mm=diameter)
+    if use_hint:
+        location = lobe_from_coord(coord_x, coord_y, coord_z)
+        if lang == "cn":
+            hint = STRUCTURED_HINT_CN.format(location=location, diameter_mm=diameter)
+        else:
+            hint = STRUCTURED_HINT_EN.format(location=location, diameter_mm=diameter)
+        full_instruction = instruction + "\n" + hint
     else:
-        hint = STRUCTURED_HINT_EN.format(location=location, diameter_mm=diameter)
-
-    # User prompt = 指令模板 + 结构化提示
-    full_instruction = instruction + "\n" + hint
+        full_instruction = instruction
 
     content = []
     for p in image_paths:
@@ -395,6 +397,10 @@ def main():
     parser.add_argument("--val_split", type=float, default=0.15)
     parser.add_argument("--max_samples", type=int, default=0,
                         help="限制样本数 (0=全部, 用于快速测试)")
+    parser.add_argument("--slices_per_nodule", type=int, default=1,
+                        help="每个结节用几张切片 (1=单切片兼容旧数据, 3-5=多切片)")
+    parser.add_argument("--no_structured_hint", action="store_true",
+                        help="去掉结构化临床提示，强迫模型从图像提取特征")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -437,15 +443,33 @@ def main():
 
     for feats in tqdm(all_features, desc="构建样本"):
         suid = feats["seriesuid"]
-        # 优先用 PNG（Qwen2.5-VL 原生支持），没有则回退 .mhd
-        png_path = os.path.join(png_dir, f"{suid}.png")
-        mhd_path = os.path.join(images_dir, f"{suid}.mhd")
-        if os.path.exists(png_path):
-            image_path = png_path
-        elif os.path.exists(mhd_path):
-            image_path = mhd_path
+
+        # ── 图像查找（多切片优先）──
+        import glob as _glob
+        if args.slices_per_nodule > 1:
+            # 多切片模式: {seriesuid}_nodule_*_slice_*.png
+            png_pattern = os.path.join(png_dir, f"{suid}_nodule_*_slice_*.png")
+            png_candidates = sorted(_glob.glob(png_pattern))
+            if png_candidates:
+                # 取前 N 张切片
+                image_paths = png_candidates[:args.slices_per_nodule]
+            else:
+                # fallback: 旧格式 {seriesuid}_slice_*.png
+                alt_pattern = os.path.join(png_dir, f"{suid}_slice_*.png")
+                image_paths = sorted(_glob.glob(alt_pattern))[:args.slices_per_nodule]
         else:
-            continue
+            image_paths = []
+
+        if not image_paths:
+            # 单切片兼容: {seriesuid}.png 或 .mhd
+            png_path = os.path.join(png_dir, f"{suid}.png")
+            mhd_path = os.path.join(images_dir, f"{suid}.mhd")
+            if os.path.exists(png_path):
+                image_paths = [png_path]
+            elif os.path.exists(mhd_path):
+                image_paths = [mhd_path]
+            else:
+                continue
 
         # 生成报告
         if api_key:
@@ -468,11 +492,11 @@ def main():
             report_cn = build_enhanced_report(feats, "cn")
             report_en = build_enhanced_report(feats, "en")
 
-        image_paths = [image_path]
-
-        s_cn = build_sft_sample(image_paths, report_cn, feats, lang="cn")
+        s_cn = build_sft_sample(image_paths, report_cn, feats, lang="cn",
+                                 use_hint=not args.no_structured_hint)
         samples_cn.append(s_cn)
-        s_en = build_sft_sample(image_paths, report_en, feats, lang="en")
+        s_en = build_sft_sample(image_paths, report_en, feats, lang="en",
+                                 use_hint=not args.no_structured_hint)
         samples_en.append(s_en)
 
     # 4. 合并 & 划分
@@ -498,6 +522,8 @@ def main():
         print(f"  {name}: {len(data)} 条 → {path}")
 
     print(f"\n[DONE] SFT 数据集: {len(train)}/{len(val)} (train/val)")
+    if args.slices_per_nodule > 1:
+        print(f"  🔬 多切片模式: {args.slices_per_nodule} 层/结节")
     if not api_key:
         print("  ℹ️  未使用 DeepSeek API，报告为增强模板。")
         print("  要使用真实报告风格，请提供 --deepseek_api_key")

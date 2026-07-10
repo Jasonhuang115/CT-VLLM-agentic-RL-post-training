@@ -18,6 +18,8 @@ from unsloth import FastVisionModel
 from peft import PeftModel
 from tqdm import tqdm
 
+from wandb_utils import get_logger
+
 
 # ═══════════════════════════════════════════════════════════════
 # 文本提取
@@ -230,6 +232,9 @@ def main():
     print(f"  Batch:    {args.batch_size} × {args.grad_accum} = {args.batch_size * args.grad_accum}")
     print(f"  Epochs:   {args.epochs}")
 
+    # WandB logger
+    wb_logger = get_logger("simpo", args.output, config=args)
+
     # ── 1. 加载数据 ──
     train_file = os.path.join(args.data_dir, "dpo_train.jsonl")
     val_file = os.path.join(args.data_dir, "dpo_val.jsonl")
@@ -308,6 +313,11 @@ def main():
                 pbar.set_postfix(loss=f"{accum_loss * args.grad_accum:.4f}",
                                  acc=f"{acc.item():.3f}",
                                  lr=f"{sched.get_last_lr()[0]:.2e}")
+                wb_logger.log({
+                    "simpo/loss": accum_loss * args.grad_accum,
+                    "simpo/acc": acc.item(),
+                    "simpo/lr": sched.get_last_lr()[0],
+                }, step=global_step)
                 accum_loss = 0.0
 
                 if global_step % args.save_steps == 0:
@@ -333,6 +343,8 @@ def main():
 
     print(f"\n[DONE]  →  {adapter_out}")
     print(f"Next: python training/stage3_grpo.py --adapter {adapter_out}")
+
+    wb_logger.finish()
 
 
 if __name__ == "__main__":

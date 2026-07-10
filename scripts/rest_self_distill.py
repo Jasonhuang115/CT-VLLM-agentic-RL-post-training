@@ -26,6 +26,7 @@ from tqdm import tqdm
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "training"))
 from reward_functions import composite_reward
+from wandb_utils import get_logger
 
 
 def extract_image_paths(messages: list) -> list:
@@ -89,6 +90,10 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--grad_accum", type=int, default=8)
     parser.add_argument("--max_samples", type=int, default=0)
+    parser.add_argument("--no_4bit", action="store_true",
+                        help="禁用 4-bit 量化，用 BF16（RTX 5090 推荐开启）")
+    parser.add_argument("--batch_generate", action="store_true",
+                        help="使用 num_return_sequences 批量生成（共享 prompt KV-cache，大幅加速）")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -104,6 +109,9 @@ def main():
     print(f"  保留比例: {args.top_frac:.0%}")
     print(f"  最低 reward: {args.min_reward}")
 
+    # WandB logger
+    wb_logger = get_logger("rest", args.output, config=args)
+
     # ── 1. Load data ──
     train_file = os.path.join(args.data_dir, "sft_train.jsonl")
     ds = load_dataset("json", data_files={"train": train_file})["train"]
@@ -113,9 +121,10 @@ def main():
     print(f"[DATA] {len(ds)} 条训练数据 (from {total})")
 
     # ── 2. Load model ──
-    print("[MODEL] Loading …")
+    use_4bit = not args.no_4bit
+    print(f"[MODEL] Loading … (4bit={use_4bit})")
     model, tok = FastVisionModel.from_pretrained(
-        args.model_path, load_in_4bit=True, use_gradient_checkpointing="unsloth")
+        args.model_path, load_in_4bit=use_4bit, use_gradient_checkpointing="unsloth")
     if os.path.exists(args.adapter):
         model = PeftModel.from_pretrained(model, args.adapter)
         print(f"  Loaded adapter: {args.adapter}")
@@ -125,7 +134,7 @@ def main():
         p.requires_grad = False
 
     # ── 3. Generate & Score ──
-    print("[GENERATE] 生成候选报告 …")
+    print(f"[GENERATE] 生成候选报告 … (batch_generate={args.batch_generate})")
     candidates = []  # (data_idx, completion_text, reward, original_sample)
 
     pbar = tqdm(range(len(ds)), desc="生成+打分")
@@ -139,31 +148,63 @@ def main():
 
         user_msgs = [m for m in msgs if m["role"] != "assistant"]
         prompt_text = tok.apply_chat_template(user_msgs, tokenize=False, add_generation_prompt=True)
+        matched_imgs = match_images(prompt_text, img_paths)
+
+        # ★ 关键优化：图像处理/tokenize 提到循环外，只做一次
+        gen_enc = tok(text=[prompt_text], images=matched_imgs, return_tensors="pt")
+        gen_enc = {k: v.to(device) for k, v in gen_enc.items()}
 
         gt = build_reward_gt(metadata)
 
-        for gen_i in range(args.n_generations):
+        if args.batch_generate:
+            # 批量生成：一次 generate() 调用生成 N 条，共享 prompt KV-cache
             with torch.no_grad():
-                gen_enc = tok(text=[prompt_text], images=match_images(prompt_text, img_paths),
-                              return_tensors="pt")
-                gen_enc = {k: v.to(device) for k, v in gen_enc.items()}
-                gen_ids = model.generate(**gen_enc, max_new_tokens=args.max_new_tokens,
-                                         do_sample=True, temperature=args.temperature,
-                                         pad_token_id=tok.pad_token_id or tok.eos_token_id)
-            new_ids = gen_ids[0, gen_enc["input_ids"].shape[1]:]
-            completion = tok.decode(new_ids, skip_special_tokens=True)
-            reward = composite_reward(completion, gt)
-
-            candidates.append({
-                "idx": idx,
-                "completion": completion,
-                "reward": float(reward),
-                "sample": s,
-            })
+                gen_ids = model.generate(
+                    **gen_enc,
+                    max_new_tokens=args.max_new_tokens,
+                    do_sample=True, temperature=args.temperature,
+                    num_return_sequences=args.n_generations,
+                    pad_token_id=tok.pad_token_id or tok.eos_token_id,
+                )
+            prompt_len = gen_enc["input_ids"].shape[1]
+            for gi in range(args.n_generations):
+                new_ids = gen_ids[gi, prompt_len:]
+                completion = tok.decode(new_ids, skip_special_tokens=True)
+                reward = composite_reward(completion, gt)
+                candidates.append({
+                    "idx": idx,
+                    "completion": completion,
+                    "reward": float(reward),
+                    "sample": s,
+                })
+        else:
+            # 逐条生成（慢，但兼容性好）
+            for gen_i in range(args.n_generations):
+                with torch.no_grad():
+                    gen_ids = model.generate(
+                        **gen_enc,
+                        max_new_tokens=args.max_new_tokens,
+                        do_sample=True, temperature=args.temperature,
+                        pad_token_id=tok.pad_token_id or tok.eos_token_id,
+                    )
+                new_ids = gen_ids[0, gen_enc["input_ids"].shape[1]:]
+                completion = tok.decode(new_ids, skip_special_tokens=True)
+                reward = composite_reward(completion, gt)
+                candidates.append({
+                    "idx": idx,
+                    "completion": completion,
+                    "reward": float(reward),
+                    "sample": s,
+                })
 
         if candidates:
             recent = [c["reward"] for c in candidates[-args.n_generations:]]
             pbar.set_postfix(r_mean=f"{sum(recent)/len(recent):.3f}", r_max=f"{max(recent):.3f}")
+            wb_logger.log({
+                "generate/r_mean": sum(recent)/len(recent),
+                "generate/r_max": max(recent),
+                "generate/n_candidates": len(candidates),
+            }, step=idx)
 
     # ── 4. Filter top-k ──
     print(f"\n[FILTER] 总候选: {len(candidates)}")
@@ -186,6 +227,12 @@ def main():
 
     rewards = [c["reward"] for c in kept]
     print(f"  保留: {len(kept)} 条 (min={min(rewards):.3f}, med={sorted(rewards)[len(rewards)//2]:.3f}, max={max(rewards):.3f})")
+    wb_logger.log({
+        "filter/n_kept": len(kept),
+        "filter/reward_min": min(rewards),
+        "filter/reward_median": sorted(rewards)[len(rewards)//2],
+        "filter/reward_max": max(rewards),
+    })
 
     # ── 5. Build augmented data ──
     print("[DATA] 构建增强数据集 …")
@@ -238,9 +285,16 @@ def main():
 
     # Reload model in train mode
     model, tok = FastVisionModel.from_pretrained(
-        args.model_path, load_in_4bit=True, use_gradient_checkpointing="unsloth")
+        args.model_path, load_in_4bit=use_4bit, use_gradient_checkpointing="unsloth")
     if os.path.exists(args.adapter):
         model = PeftModel.from_pretrained(model, args.adapter)
+    else:
+        # 没有 LoRA adapter (例如用 merged model 作为 base) → 加新的 LoRA
+        print("  No adapter found, adding fresh LoRA for ReST SFT …")
+        model = FastVisionModel.get_peft_model(
+            model, finetune_vision_layers=False, finetune_language_layers=True,
+            finetune_attention_modules=True, finetune_mlp_modules=True,
+            r=16, lora_alpha=32, lora_dropout=0.05)
     for n, p in model.named_parameters():
         p.requires_grad = "lora" in n.lower()
     model.train()
@@ -315,6 +369,10 @@ def main():
                 epoch_loss_sum += avg_loss
                 epoch_n += 1
                 pbar.set_postfix(loss=f"{avg_loss:.4f}")
+                wb_logger.log({
+                    "rest_sft/loss": avg_loss,
+                    "rest_sft/lr": sched.get_last_lr()[0],
+                }, step=global_step)
                 accum_loss = 0.0
                 batch_losses = []
 
@@ -335,6 +393,8 @@ def main():
     print(f"\n[DONE] → {adapter_out}")
     print(f"  Reward median: {stats['reward_median']:.3f}")
     print(f"  Augmented data: {len(augmented)} 条")
+
+    wb_logger.finish()
 
 
 if __name__ == "__main__":

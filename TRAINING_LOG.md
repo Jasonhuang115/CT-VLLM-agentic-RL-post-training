@@ -400,9 +400,528 @@ export WANDB_MODE=offline
 
 ---
 
-**最后更新**: 2026-07-06  
+---
+
+## 九、最终训练策略（832 样本）— 2026-07-10
+
+### 数据确认
+
+| 指标 | 实际值 |
+|------|--------|
+| CT 扫描 (.mhd) | 704 |
+| 匹配结节 | 854 |
+| 训练样本 | 832 |
+| 损坏文件 | 1 |
+
+### 为什么砍掉原计划的部分 Stage
+
+| Stage | 决策 | 原因 |
+|-------|------|------|
+| **SimPO** | ❌ 跳过 | DPO 偏好对差异太小（模板扰动），梯度信号弱；当前实现有图像条件化 bug（用 bare tok 算无条件 P(text)，模型看不到 CT）。832 样本的偏好对质量不够 |
+| **Agent SFT/GRPO (4a/4b)** | ❌ 跳过 | 需要 ReAct 工具调用轨迹数据，当前没有。且基础报告生成任务未收敛前不应引入工具使用 |
+| **GRPO (Stage 3)** | ⏸️ 延后到 ReST 收敛后 | GRPO 需要足够多的 prompt → 多样探索，ReST 2-3 轮后模型和数据质量都提升了再做，lr 1e-5 极小步长 |
+
+### 最终 Pipeline
+
+```
+Stage 1 SFT (已完成, stage1_full_v2)
+    ↓
+ReST Round 1 (当前正在跑, stage1_rest_v1)
+    ↓
+ReST Round 2 (adapter=rest_v1, output=rest_v2)
+    ↓
+[ReST Round 3 — 如果 reward_median 还在涨]
+    ↓
+轻量 GRPO (lr=1e-5, max_steps=200, beta=0.01)
+    ↓
+评估
+```
+
+### ReST 收敛判断
+
+每轮完成后看 `rest_stats.json` 的 `reward_median`：
+- Round N+1 > Round N × 1.05 → 继续下一轮
+- Round N+1 ≈ Round N → 收敛，进入 GRPO
+
+### 各阶段命令
+
+```bash
+# ReST Round 2
+python scripts/rest_self_distill.py \
+    --model_path /root/autodl-tmp/models/Qwen2.5-VL-3B-Instruct \
+    --adapter /root/autodl-tmp/outputs/stage1_rest_v1/lora_adapter \
+    --data_dir /root/autodl-tmp/data/sft_full_v2 \
+    --output /root/autodl-tmp/outputs/stage1_rest_v2 \
+    --no_4bit --batch_generate \
+    --n_generations 4 --max_new_tokens 512
+
+# ReST Round 3（可选）
+# adapter → rest_v2, output → rest_v3
+
+# 轻量 GRPO（ReST 收敛后）
+python training/stage3_grpo.py \
+    --adapter /root/autodl-tmp/outputs/stage1_rest_v2/lora_adapter \
+    --data_dir /root/autodl-tmp/data/sft_full_v2 \
+    --output /root/autodl-tmp/outputs/stage3_grpo_light \
+    --num_generations 8 --lr 1e-5 --beta 0.01 --max_steps 200
+```
+
+### 为什么 ReST 是小数据最优解
+
+- 不需要偏好对（不像 SimPO）
+- 不需要大量探索（不像 GRPO）
+- generate → filter → SFT 是封闭循环，数据质量逐轮提升
+- 每轮用更好的模型生成更好的样本 → 正向飞轮
+
+---
+
+## 十、P4 ReST 自蒸馏性能优化 — 2026-07-10
+
+### 问题
+
+`rest_self_distill.py` 在 RTX 5090 上跑 832 样本 × 4 次生成 ≈ **9+ 小时**，每个样本 ~41 秒。
+
+### 根因分析
+
+| 瓶颈 | 严重度 | 说明 |
+|------|--------|------|
+| 图像重复编码 | 🔴🔴🔴 | `tok(text=..., images=...)` 在 4 次生成的循环内，每次重新 load/resize/normalize CT 图 |
+| Prompt KV-cache 不复用 | 🔴🔴🔴 | 同一 prompt 的 4 次 `model.generate()` 各自独立计算完整前向 |
+| 4-bit 量化开销 | 🟡🟡 | RTX 5090 32GB 跑 3B 模型绰绰有余，dequantize 反而拖慢推理 |
+| 无 Flash Attention 2 | 🟡 | 环境 `FA2 = False`，长序列 attention 慢 |
+| 无批处理 | 🟡 | 串行逐个样本，GPU 利用率低 |
+
+### 改动内容 (`scripts/rest_self_distill.py`)
+
+1. **新增 `--no_4bit` 参数** — 禁用 4-bit 量化，用 BF16 推理（3B 模型仅需 ~6GB，RTX 5090 完全够）
+2. **新增 `--batch_generate` 参数** — 用 `num_return_sequences=N` 一次 `generate()` 调用生成 N 条，共享 prompt KV-cache
+3. **图像预处理提到循环外** — `tok()` 只在样本级调用一次，不在 N 次生成循环内重复调用
+4. **训练阶段也尊重 `use_4bit`** — 两处模型加载（推理 + 训练）统一使用 `use_4bit` 变量
+
+### 优化后启动命令
+
+```bash
+# 推荐：全量跑
+python scripts/rest_self_distill.py \
+    --model_path /root/autodl-tmp/models/Qwen2.5-VL-3B-Instruct \
+    --adapter /root/autodl-tmp/outputs/stage1_full_v2/lora_adapter \
+    --data_dir /root/autodl-tmp/data/sft_full_v2 \
+    --output /root/autodl-tmp/outputs/stage1_rest_v1 \
+    --no_4bit \
+    --batch_generate \
+    --n_generations 4 \
+    --max_new_tokens 512
+
+# 极速验证模式（200 样本，~30-40 分钟）
+python scripts/rest_self_distill.py \
+    ... \
+    --no_4bit \
+    --batch_generate \
+    --n_generations 2 \
+    --max_new_tokens 256 \
+    --max_samples 200
+```
+
+### 预估提速
+
+| 优化 | 单样本耗时 | 832 样本总时间 |
+|------|-----------|---------------|
+| 原始 (4-bit, 无缓存复用) | ~41s | ~9h |
+| + `--no_4bit` | ~25s | ~5.5h |
+| + `--batch_generate` (KV-cache 共享) | ~12s | ~2.5h |
+| + `n_generations=2, max_tokens=256` | ~4s | ~1h |
+| + 安装 flash-attn | ~2-3s | ~30-40min |
+
+### 可选：AutoDL 上装 flash-attn
+
+```bash
+pip install flash-attn --no-build-isolation
+```
+
+---
+
+## 十一、多切片 Pipeline 执行记录 — 2026-07-10
+
+### 关键发现：原始 PNG 切片不含结节
+
+`mhd_to_png.py` 取的是 CT 扫描**中心轴向切片** (`z_center = shape[0] // 2`)，而不是结节实际 Z 坐标。`sft_dataset_builder.py` 用 `{seriesuid}.png` 完全不使用 `coordZ`。VLM 可能根本没看到结节。
+
+### 改动
+
+| 文件 | 改动 | 状态 |
+|------|------|------|
+| `data/mhd_to_png.py` | 新增 `--mode nodule_slices`：读取 `nodule_features.json`，在每结节 `coordZ` 处取 N 层 PNG | ✅ |
+| `data/sft_dataset_builder.py` | 新增 `--slices_per_nodule`：glob 匹配多切片 PNG → 每样本含多张图 | ✅ |
+
+### 执行记录
+
+```bash
+# Step 1: 多切片 PNG 提取
+python data/mhd_to_png.py --mode nodule_slices \
+    --images_dir /root/autodl-tmp/data/LUNA16/images \
+    --features /root/autodl-tmp/data/nodule_features.json \
+    --output_dir /root/autodl-tmp/data/LUNA16/images_png \
+    --n_slices 3 --slice_spacing_mm 2.0
+# 结果: 854 结节 → 2562 张 PNG (0 失败), 2.5 分钟
+
+# Step 2: 重建 SFT 数据
+python data/sft_dataset_builder.py \
+    --features /root/autodl-tmp/data/nodule_features.json \
+    --output /root/autodl-tmp/data/sft_multislice \
+    --slices_per_nodule 3
+# 结果: 1438 train / 270 val (CN+EN), 3 张图/样本
+
+# Step 3: 多切片 SFT (进行中)
+python training/stage1_sft.py \
+    --data_dir /root/autodl-tmp/data/sft_multislice \
+    --output /root/autodl-tmp/outputs/stage1_multislice_v1 \
+    --epochs 3 --lr 2e-4 \
+    --batch_size 1 --grad_accum 8 \
+    --unfreeze_vision 1 --unfreeze_vit_layers 2 --vit_lr_ratio 0.1
+```
+
+### 数据对比
+
+| 版本 | 样本数 | 图/样本 | 有效视觉数据 | 切片位置 |
+|------|--------|---------|-------------|---------|
+| 旧 (中心切片) | 832 CN+EN | 1 | 832 张 | CT 中心（可能无结节） |
+| 新 (多切片) | 1438 CN+EN | 3 | 4314 张 | 结节 Z 坐标 ±2mm |
+
+### 完整管线 (待执行)
+
+```
+Stage 1 SFT (多切片) → ReST×2 → SimPO → 轻量 REINFORCE → 评估
+```
+
+详见 [plan-fuzzy-mountain.md](.claude/plans/plan-fuzzy-mountain.md)。
+
+---
+
+## 十二、重大坑：P1 Structured Hints 导致 Text-Copy 短路 — 2026-07-10
+
+### 现象
+
+SFT 训练 loss 正常下降（302→255→203），但模型生成质量极差——输出"无法确定"、"请提供图像"等泛泛回复，完全不用视觉信息。
+
+### 诊断方法
+
+对比**有图像**和**无图像**生成结果：
+```python
+# 有图 vs 无图 → 输出完全相同 → 模型在抄 prompt，没看图
+```
+
+### 根因
+
+P1 的 "structured clinical hints" 把结节位置+直径注入 prompt：
+```
+请评估这个肺结节的恶性风险。
+[临床提示：结节位于右上叶，直径约 12.3mm，建议重点关注其边界特征和密度类型...]
+```
+模型学会直接从 hint 文本复制答案，**完全绕过了视觉通路**。LoRA 权重学到的是 text→text mapping，不是 image→text。
+
+### 教训
+
+> **任何注入 prompt 的提示信息都会成为模型偷懒的捷径。**
+> VLM 训练中，"让模型看图"的唯一方式是不给它任何文字线索。
+
+### 修复
+
+1. `sft_dataset_builder.py` 新增 `--no_structured_hint` 参数
+2. 无条件时 prompt 变成：
+   ```
+   请评估这个肺结节的恶性风险。包括大小、边界、密度类型、钙化状态等关键指标，并给出Lung-RADS分级。
+   ```
+3. 重建数据：1472 train / 236 val（no-hint + 多切片）
+
+### 验证标准
+
+训练完成后必须跑有图 vs 无图对比测试，输出**明显不同**才算视觉学习成功。
+
+---
+
+## 十三、训练策略澄清：视觉感知 vs 报告质量 — 2026-07-10
+
+### 关键认知
+
+| 阶段 | 目标 | 数据依赖 |
+|------|------|---------|
+| **Luna16 SFT** | VLM 学会"看到结节"（视觉感知） | CT 图像 + 结节特征 GT |
+| **SimPO / GRPO** | 优化报告质量（文本生成） | 偏好对 / reward 打分 |
+
+这两个是**不同的能力维度**。Luna16 数据少不影响 SimPO/GRPO——后者优化的是"报告写得好不好"，前者确保"模型看图说话"。不能用"视觉数据少"为理由砍掉 SimPO/GRPO。
+
+### 最终管线
+
+```
+Stage 1 SFT (多切片, no-hint) → ReST × 2 → Stage 2 SimPO (image-conditioned v3) → Stage 3 轻量 REINFORCE → 评估
+```
+
+---
+
+## 十四、WandB 日志集成 — 2026-07-10
+
+### 新增文件
+
+| 文件 | 说明 |
+|------|------|
+| `training/wandb_utils.py` | 共享 wandb logger，自动 fallback（未安装或 DISABLED 时不报错） |
+
+### 各阶段日志 key
+
+| Stage | 指标 |
+|-------|------|
+| SFT | `train/loss`, `train/lr`, `train/epoch` |
+| ReST | `generate/r_mean`, `generate/r_max`, `filter/reward_*`, `rest_sft/loss` |
+| SimPO | `simpo/loss`, `simpo/acc`, `simpo/lr` |
+| GRPO | `grpo/reward`, `grpo/loss`, `grpo/lr` |
+
+### 使用
+
+```python
+from wandb_utils import get_logger
+wb_logger = get_logger("sft", args.output, config=args)
+wb_logger.log({"train/loss": 3.5}, step=100)
+wb_logger.finish()
+```
+
+---
+
+## 十五、ReST 多切片运行记录 — 2026-07-10
+
+### 数据确认
+
+- sft_nohint: 1472 train / 236 val, 3 slices/sample
+- 验证: `stage1_multislice_v1` adapter **视觉在用** ✓（有图 vs 无图输出不同）
+
+### ReST Round 1 运行参数
+
+```bash
+python scripts/rest_self_distill.py \
+    --model_path /root/autodl-tmp/models/Qwen2.5-VL-3B-Instruct \
+    --adapter /root/autodl-tmp/outputs/stage1_multislice_v1/lora_adapter \
+    --data_dir /root/autodl-tmp/data/sft_nohint \
+    --output /root/autodl-tmp/outputs/rest_round1 \
+    --no_4bit --batch_generate \
+    --n_generations 4 --max_new_tokens 384
+```
+
+### 速度基准
+
+| 配置 | 速度 | 总时间(1472样本) |
+|------|------|-------------------|
+| 单切片 + 4bit + 串行 | 41s/it | ~9h |
+| 单切片 + BF16 + batch | 9.5s/it | ~2h |
+| 3切片 + BF16 + batch, max_tokens=512 | 8.4s/it | ~3.4h |
+| 3切片 + BF16 + batch, max_tokens=384 | ~6s/it | ~2.5h |
+
+### max_new_tokens 选择
+
+中文肺结节报告典型长度 200-400 字 → tokenizer 约 250-500 tokens。
+- 512: 冗余，不截断
+- 384: 覆盖大部分报告，少量长报告截断不影响 reward
+- 256: 太紧，容易截断关键内容
+
+---
+
+## 十六、Stage 2 SimPO v3 修复 (image-conditioned) — 2026-07-10
+
+### v2 bug
+
+`stage2_simpo.py` v2 用 bare tokenizer（`AutoTokenizer.from_pretrained`）算无条件 P(text)，模型看不到 CT 图像。acc≈0.50 随机。
+
+### v3 修复
+
+改用 VLM tokenizer + 完整前向（`pixel_values` + `image_grid_thw`），只在 assistant response 部分计算 log-prob。模型"看着"CT 图像判断报告优劣。
+
+### 关键代码模式
+
+所有训练脚本统一使用：
+```python
+def match_images(text, img_paths):
+    n = text.count('<|vision_start|>')
+    imgs = list(img_paths)
+    while len(imgs) < n: imgs += imgs
+    return imgs[:n]
+
+enc = tok(text=[text], images=match_images(text, img_paths), return_tensors="pt")
+```
+
+---
+
+## 十七、Stage 3 不是真正的 GRPO — 2026-07-10
+
+当前 `stage3_grpo.py` 实际是**单样本 REINFORCE + L2 log-prob 惩罚**：
+
+| 维度 | 真正 GRPO | 当前实现 |
+|------|----------|---------|
+| 优势估计 | 同 prompt 生成 G 条，组内相对优势 | 单条 reward |
+| KL 正则 | KL(π ‖ π_ref) | (log_prob)² L2 |
+| 参考模型 | 保存 frozen checkpoint | 无 |
+
+832 样本场景下单样本 REINFORCE 更合适（组内归一化不稳定），命名保持 `grpo` 但心里有数。
+
+---
+
+## 十八、4-bit 下 ViT 解冻静默失败 — 2026-07-10
+
+### 发现
+
+`unfreeze_vision_p2` 函数有 dtype 检查：
+```python
+if p.dtype in (torch.float32, torch.float16, torch.bfloat16):
+    p.requires_grad = True
+```
+4-bit 量化下参数 dtype 是 `torch.uint8`，检查永远 False → ViT 完全冻结。
+
+### 验证
+
+`stage1_multislice_v1` 虽然 `--unfreeze_vision 1`，但实际 ViT 参数更新为 0。
+
+### 修复
+
+1. 加 `--no_4bit` flag 加载 BF16 权重
+2. dtype 检查改为 warn 而非静默跳过：不匹配时打印 WARNING
+3. 训练完成后保存 **merged model**（包含 ViT 更新），下游阶段以此为 base model
+4. ReST SFT 阶段自动检测无 adapter 时添加新 LoRA
+
+### 教训
+
+> 4-bit + unfreeze 是假组合。要真正训练 ViT，必须 BF16。
+
+---
+
+## 十九、True GRPO 重写 — 2026-07-10
+
+### 旧版问题
+
+`stage3_grpo.py` 是单样本 REINFORCE + L2 log-prob 惩罚，不是真正的 GRPO。
+
+### 新版设计 (`stage3_grpo.py`)
+
+| 特性 | 旧 | 新 |
+|------|-----|-----|
+| 每 prompt 生成数 | 1 | G=4 (共享 KV-cache) |
+| 优势估计 | reward 直接作为优势 | (r_i - mean) / std 组内归一化 |
+| KL 正则 | (log_p)² L2 | exp(log_ratio) - log_ratio - 1 (无偏估计) |
+| 参考模型 | 无 | Frozen copy of DPO output |
+
+### 关键参数
+
+- `--n_generations 4`: 每组 4 条，组内相对比较
+- `--kl_beta 0.04`: DeepSeek 默认 KL 权重
+- `--lr 1e-6`: 极小步长，防止策略跳变
+- 参考模型与训练模型同构，冻结
+
+---
+
+## 二十、Stage 2: DPO + SimPO — 2026-07-10
+
+### 新增文件
+
+`training/stage2_preference.py` — 统一偏好优化脚本
+
+### 两种方法
+
+```bash
+# DPO (推荐): 有参考模型约束，稳定
+python training/stage2_preference.py --method dpo \
+    --model_path /path/to/stage1_vision_v2/merged_model \
+    --adapter /path/to/rest_round2/lora_adapter \
+    --data_dir /path/to/dpo_data \
+    --beta 0.5 --lr 5e-5 --epochs 1
+
+# SimPO: 无参考模型，省显存
+python training/stage2_preference.py --method simpo \
+    --model_path ... --adapter ... --data_dir ... \
+    --beta 0.5 --gamma 0.3
+```
+
+### DPO vs SimPO 对比
+
+| | DPO | SimPO |
+|------|-----|------|
+| 参考模型 | 需要 (+6GB) | 不需要 |
+| 长度偏差 | 有 | 无 (avg log-prob) |
+| 稳定性 | 高 | 中 |
+| 论文 | NeurIPS 2023 | ICML 2024 |
+
+### DPO 参考模型
+
+DPO 参考模型 = 训练前的 frozen 副本。防止模型为了增大 chosen 概率扭曲语言分布。公式：
+```
+Loss = -log σ(β × [log(π_θ(c)/π_ref(c)) - log(π_θ(r)/π_ref(r))])
+```
+
+---
+
+## 二十一、最终管线 (v4) — 2026-07-10
+
+### 完整流程
+
+```
+Stage 1 SFT (BF16, ViT 4层解冻, no-hint)
+  Input:  Qwen2.5-VL-3B + sft_nohint (1472, 3 slices/sample)
+  Output: stage1_vision_v2/merged_model/ + lora_adapter/
+    ↓
+DPO 数据构建
+  Input:  sft_nohint/sft_train.jsonl
+  Output: dpo_nohint/dpo_train.jsonl + dpo_val.jsonl
+    ↓
+ReST Round 1
+  Input:  merged_model + sft_nohint
+  Output: rest_round1/lora_adapter/
+    ↓
+ReST Round 2 (if reward_median improving)
+  Input:  merged_model + rest_round1 adapter + augmented data
+  Output: rest_round2/lora_adapter/
+    ↓
+Stage 2 DPO
+  Input:  merged_model + rest_round2 adapter + dpo_nohint
+  Output: stage2_dpo/lora_adapter/
+    ↓
+Stage 3 True GRPO (G=4)
+  Input:  merged_model + stage2_dpo adapter + sft_nohint
+  Output: stage3_grpo/lora_adapter/
+    ↓
+评估 (有图/无图对比 + clinical_accuracy)
+```
+
+### 各阶段职责
+
+| 阶段 | 学什么 | 优化目标 |
+|------|--------|---------|
+| SFT | 看图 → 写报告 | Cross-entropy (per-token) |
+| ReST | 生成更好报告 → SFT | composite_reward (top-50%) |
+| DPO | chosen > rejected | -log σ(β × Δlog_ratio) |
+| GRPO | 探索高 reward 生成 | Group-relative advantage + KL |
+
+### Base model 传递
+
+Stage 1 产出 **merged_model**（BF16, ViT 更新已合并）。
+所有下游阶段都以 merged_model 为 base，在此基础上叠加新的 LoRA adapter。
+ReST 首次运行无 adapter 时自动添加新 LoRA。
+
+### 预估时间 (RTX 5090)
+
+| 阶段 | 时间 |
+|------|------|
+| Stage 1 SFT (5 epoch, BF16) | ~4-5h |
+| DPO 数据构建 | ~5min |
+| ReST × 2 | ~5-6h |
+| Stage 2 DPO | ~1-2h |
+| Stage 3 GRPO | ~2-3h |
+| **总计** | **~14-17h** |
+
+---
+
+**最后更新**: 2026-07-10  
+**新文件**:
+- `training/stage2_preference.py` — DPO + SimPO 偏好优化
+- `training/stage3_grpo.py` — True GRPO (重写)
+
 **待完成**: 
-1. 本地下载 LUNA16 subset 1-6, 8, 9
-2. AutoDL 上修复 stage2_simpo.py DataLoader 并跑通小批量验证
-3. 对比 v1 vs v2 的 Val acc
-4. 如有 DeepSeek API key，批量生成高质量报告
+1. 推送到 AutoDL
+2. Stage 1 BF16 SFT: `--no_4bit --unfreeze_vit_layers 4 --vit_lr_ratio 0.5`
+3. 构建 DPO 数据 (`dpo_dataset_builder.py --sft_data sft_nohint`)
+4. ReST Round 1 → Round 2 → DPO → GRPO
+5. CT-RATE reward model 训练（未来工作）

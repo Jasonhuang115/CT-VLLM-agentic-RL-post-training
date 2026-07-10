@@ -9,6 +9,14 @@ GRPO 训练的核心组件。5 信号复合奖励 + 防策略坍缩机制。
 使用方式:
   from training.reward_functions import composite_reward
   score = composite_reward(completion, ground_truth, config)
+
+TODO — CT-RATE reward model:
+  当前 reward 全量基于规则 (关键词匹配, 数值提取, 正则检查)。
+  CT-RATE (47K 真实放射科报告) 可用于训练一个 BERT-based reward model:
+    1. 用 CT-RATE 报告 fine-tune BioBERT/RadBERT 作为文本质量评估器
+    2. 输出 [0,1] 分数评估"这段报告读起来像真实放射科报告"的程度
+    3. 与现有规则 reward 做加权融合: r = 0.5*r_rule + 0.5*r_ctrate
+  好处: 不再依赖 hard-coded 正则，reward 更平滑，GRPO 梯度信号更稳定。
 """
 
 import re

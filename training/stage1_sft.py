@@ -13,6 +13,8 @@ from datasets import load_dataset
 from unsloth import FastVisionModel
 from tqdm import tqdm
 
+from wandb_utils import get_logger
+
 
 def extract_image_paths(messages: list) -> list:
     """Extract image paths from user messages."""
@@ -45,9 +47,12 @@ def unfreeze_vision_p2(model, vit_layers: int = 2):
         merger_names = [n for n in visual_names if "block" not in n.lower()]
     for n, p in model.named_parameters():
         if any(m in n for m in merger_names[:3]):  # 前3个作为模式匹配
-            if p.dtype in (torch.float32, torch.float16, torch.bfloat16):
-                p.requires_grad = True
-                vit_params.add(n)
+            # BF16 下 p.dtype==torch.bfloat16；4-bit 下 p.dtype==torch.uint8 且 requires_grad 永远为 False
+            if p.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+                print(f"[VISION] WARNING: {n} dtype={p.dtype} — 4-bit 下 ViT 无法解冻！请加 --no_4bit")
+                continue
+            p.requires_grad = True
+            vit_params.add(n)
     print(f"[VISION] Projector/merger unfrozen: {len([n for n in vit_params if 'merger' in n.lower() or 'block' not in n.lower()])} params")
 
     # 3. 解冻 ViT 最后 N 层
@@ -66,9 +71,11 @@ def unfreeze_vision_p2(model, vit_layers: int = 2):
             for n, p in model.named_parameters():
                 for lid in last_n:
                     if f".{lid}." in n or f"blocks.{lid}" in n or f"layers.{lid}" in n:
-                        if p.dtype in (torch.float32, torch.float16, torch.bfloat16):
-                            p.requires_grad = True
-                            vit_params.add(n)
+                        if p.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+                            print(f"[VISION] WARNING: {n} dtype={p.dtype} — 4-bit 无法解冻！请加 --no_4bit")
+                            continue
+                        p.requires_grad = True
+                        vit_params.add(n)
                         break
 
     vit_count = len(vit_params)
@@ -97,6 +104,8 @@ def main():
                         help="Number of ViT layers to unfreeze (default 2)")
     parser.add_argument("--vit_lr_ratio", type=float, default=0.1,
                         help="ViT LR = lr * vit_lr_ratio (default 0.1)")
+    parser.add_argument("--no_4bit", action="store_true",
+                        help="Disable 4-bit quantization, use BF16 (required for real ViT unfreezing)")
     args = parser.parse_args()
 
     os.makedirs(args.output, exist_ok=True)
@@ -112,10 +121,10 @@ def main():
     ds = load_dataset("json", data_files={"train": train_file, "validation": val_file})
     print(f"[DATA] train={len(ds['train'])}, val={len(ds['validation'])}")
 
-    # ── 2. Load model ──
-    print("[MODEL] Loading FastVisionModel …")
+    use_4bit = not args.no_4bit
+    print(f"[MODEL] Loading FastVisionModel (4bit={use_4bit}) …")
     model, tok = FastVisionModel.from_pretrained(
-        args.model_path, load_in_4bit=True, use_gradient_checkpointing="unsloth")
+        args.model_path, load_in_4bit=use_4bit, use_gradient_checkpointing="unsloth")
     model = FastVisionModel.get_peft_model(
         model, finetune_vision_layers=False, finetune_language_layers=True,
         finetune_attention_modules=True, finetune_mlp_modules=True,
@@ -151,6 +160,9 @@ def main():
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=total_steps)
 
     print(f"[TRAIN] ~{steps_per_epoch} steps/epoch, {total_steps} total\n")
+
+    # WandB logger
+    wb_logger = get_logger("sft", args.output, config=args)
 
     global_step = 0
 
@@ -233,6 +245,11 @@ def main():
 
                 pbar.set_postfix(loss=f"{avg_loss:.4f}",
                                  lr=f"{sched.get_last_lr()[0]:.2e}")
+                wb_logger.log({
+                    "train/loss": avg_loss,
+                    "train/lr": sched.get_last_lr()[0],
+                    "train/epoch": epoch + 1,
+                }, step=global_step)
                 accum_loss = 0.0
 
                 if global_step % args.save_steps == 0:
@@ -248,12 +265,24 @@ def main():
     adapter_out = os.path.join(args.output, "lora_adapter")
     model.save_pretrained(adapter_out)
     tok.save_pretrained(adapter_out)
+    print(f"[SAVE] LoRA adapter → {adapter_out}")
 
-    cfg = {"stage": "sft_v3", "epochs": args.epochs, "lr": args.lr}
+    # 保存 merged model（包含 ViT 权重更新，4-bit 下 adapter 不保存非 LoRA 参数的修改）
+    merged_out = os.path.join(args.output, "merged_model")
+    print(f"[SAVE] Saving merged model (with ViT updates) → {merged_out} …")
+    model.save_pretrained_merged(merged_out, tokenizer=tok)
+    print(f"[SAVE] Merged model saved ({sum(p.numel() for p in model.parameters()) / 1e9:.2f}B params)")
+
+    cfg = {"stage": "sft_vision_v2", "epochs": args.epochs, "lr": args.lr,
+           "unfreeze_vit_layers": args.unfreeze_vit_layers, "vit_lr_ratio": args.vit_lr_ratio,
+           "use_4bit": use_4bit, "n_vit_params": len(vit_param_names)}
     with open(os.path.join(args.output, "training_config.json"), "w") as f:
         json.dump(cfg, f, indent=2)
 
-    print(f"\n[DONE] → {adapter_out}")
+    print(f"\n[DONE] LoRA: {adapter_out}")
+    print(f"[DONE] Merged: {merged_out}")
+
+    wb_logger.finish()
 
 
 if __name__ == "__main__":

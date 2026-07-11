@@ -963,3 +963,88 @@ ReST 首次运行无 adapter 时自动添加新 LoRA。
 | `data/mhd_to_png.py` | 两处加 `img.resize((512,512), Image.LANCZOS)` |
 | `training/stage1_sft.py` | 已有 `--no_4bit, --unfreeze_vit_layers, --vit_lr_ratio` |
 
+
+---
+
+## 二十三、多视图 (轴位+冠位+矢位) 替换单轴位 — 2026-07-11
+
+### 问题
+单轴位切片只有一个视角, 5mm 结节在 50mm ROI 中仅占 10% 画面。
+冠状面和矢状面提供正交视角, 对判断结节形态 (球形/不规则) 和边界特征至关重要。
+
+### 改动
+`mhd_to_png.py` 新增 `multi_view` 模式, 基于结节世界坐标 (coordX/Y/Z) 提取三平面视图:
+- **轴位 (Axial)**: Z 固定, 截取 ROI 内 (Y, X) 平面
+- **冠状位 (Coronal)**: Y 固定, 截取 ROI 内 (Z, X) 平面  
+- **矢状位 (Sagittal)**: X 固定, 截取 ROI 内 (Z, Y) 平面
+
+每视图 50mm ROI, 512x512 LANCZOS resize。
+
+### 命令
+```bash
+python data/mhd_to_png.py --mode multi_view \
+    --images_dir /root/autodl-tmp/data/LUNA16/images \
+    --features /root/autodl-tmp/data/nodule_features.json \
+    --output_dir /root/autodl-tmp/data/LUNA16/images_png_mv
+```
+
+### 数据统计
+- 854 结节 × 3 视图 = 2562 张 PNG
+- SFT: 1460 train / 248 val
+
+### 训练
+```bash
+python training/stage1_sft.py \
+    --data_dir /root/autodl-tmp/data/sft_mv \
+    --output /root/autodl-tmp/outputs/stage1_mv_v1 \
+    --epochs 5 --lr 2e-4 \
+    --batch_size 1 --grad_accum 8 \
+    --no_4bit --unfreeze_vision 1 --unfreeze_vit_layers 4 --vit_lr_ratio 0.5
+```
+
+### 文件改动
+| 文件 | 改动 |
+|------|------|
+| `data/mhd_to_png.py` | 新增 `extract_multi_view()` + `--mode multi_view` CLI |
+
+
+
+---
+
+## 二十四、DPO prompt 缺图 + 六大类精细错误 — 2026-07-11
+
+### DPO loss=0 根因
+v2 DPO 数据的 `prompt_messages` 只含文本不含图像路径。
+DPO 训练时模型看不到 CT，只在 ~350 字纯文本上判断 chosen vs rejected（79% 字符相同）。
+修复: `build_dpo_from_lidc.py` 中 `prompt_content` 加 `{"type":"image","image":"/path/to/png"}`。
+
+### 六大类错误设计
+| 类别 | 选哪些结节 | 错误模式 |
+|------|----------|---------|
+| 严重度降级 | spi≥3 或 mal≥3 | 中→轻, 可疑→不确定, L-R 降级 |
+| 特征漏报 | calc≤4 或 spi≥3 或 lob≥2 | 有毛刺/分叶/钙化但报告不提 |
+| 特征误判 | tex≥4 或 margin≥3 | 实性→磨玻璃, 模糊→清晰, 恶性降级 |
+| 假精度 | 任意 | 12.3192mm, 带坐标, -120HU |
+| 过度委婉 | mal≥3 且 spi≥2 | 疯狂加"不确定""建议结合临床" |
+| L-R 不匹配 | mal≥3 且 d≥8 | 特征正确但评级低一级 |
+
+### 90 对 DPO 完成, but GRPO is the main event
+DPO epoch loss=0.67, acc=0.40 (wandb per-step display bug showing 0.00).
+DPO 修风格, GRPO 修正确性。直接用 LIDC GT 做奖励信号纠正密度/边界/毛刺误判。
+
+### 文件改动
+| 文件 | 改动 |
+|------|------|
+| `data/build_dpo_from_lidc.py` | 新建, 六大类精细错误 + 图像锚定 |
+| `data/mhd_to_png.py` | 加 `extract_multi_view` + `img.resize(512,512)` |
+| `data/sft_dataset_builder.py` | 修复 assitant content 格式 + 多视图文件匹配 |
+| `training/stage1_sft.py` | 支持 `--no_4bit --unfreeze_vit_layers --vit_lr_ratio` |
+
+### 当前管线状态
+```
+SFT (BF16, ViT 4层解冻, 多视图, 512px, 纯中文, no-hint) ✅
+  → DPO (90对, 6类精细错误, 图像锚定) ✅  (辅助, loss=0.67)
+  → GRPO (G=4, True GRPO, LIDC GT reward) ⏳  (主力, 修正确性)
+  → 评估 → 合并模型 → 部署产品
+```
+

@@ -53,6 +53,7 @@ def mhd_to_png_center(mhd_path: str, output_path: str) -> bool:
         hu_slice = hu_array[z_center, :, :]  # (Y, X)
         gray = window_lung(hu_slice)
         img = Image.fromarray(gray, mode='L')
+        img = img.resize((512, 512), Image.LANCZOS)
         img.save(output_path, format='PNG')
         return True
     except Exception as e:
@@ -153,6 +154,7 @@ def extract_nodule_slices(
         fname = f"{seriesuid}_nodule_{nodule_idx:03d}_slice_{si}.png"
         out_path = os.path.join(output_dir, fname)
         img = Image.fromarray(gray, mode='L')
+        img = img.resize((512, 512), Image.LANCZOS)
         img.save(out_path, format='PNG')
         saved.append(out_path)
 

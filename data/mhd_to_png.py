@@ -161,6 +161,88 @@ def extract_nodule_slices(
     return saved
 
 
+# ═══════════════════════════════════════════════════════════════
+# 模式 3: 多视图 (轴位+冠位+矢位, 基于结节世界坐标) — 2026-07-11
+# ═══════════════════════════════════════════════════════════════
+
+def extract_multi_view(
+    mhd_path: str,
+    coordX_mm: float, coordY_mm: float, coordZ_mm: float,
+    output_dir: str,
+    seriesuid: str,
+    nodule_idx: int,
+    roi_size_mm: float = 50.0,
+) -> list:
+    """
+    基于结节世界坐标, 提取三平面视图 (轴位/冠状/矢状)。
+
+    每个视图保存一张 512x512 PNG。
+    返回 3 张已保存文件路径列表。
+    """
+    try:
+        image = sitk.ReadImage(mhd_path)
+        hu_array = sitk.GetArrayFromImage(image)  # (Z, Y, X)
+        spacing = np.array(image.GetSpacing())
+        origin = np.array(image.GetOrigin())
+    except Exception as e:
+        print(f"  [ERROR] {mhd_path}: {e}")
+        return []
+
+    nz, ny, nx = hu_array.shape
+    dx, dy, dz = float(spacing[0]), float(spacing[1]), float(spacing[2]) if len(spacing) >= 3 else 1.0
+    ox, oy, oz = (float(origin[0]), float(origin[1]), float(origin[2]) if len(origin) >= 3 else 0.0)
+
+    # 世界坐标 → 体素坐标
+    cvx = int((coordX_mm - ox) / dx) if dx > 0 else nx // 2
+    cvy = int((coordY_mm - oy) / dy) if dy > 0 else ny // 2
+    cvz = int((coordZ_mm - oz) / dz) if dz > 0 else nz // 2
+    cvx = max(0, min(nx - 1, cvx))
+    cvy = max(0, min(ny - 1, cvy))
+    cvz = max(0, min(nz - 1, cvz))
+
+    # ROI 像素半径
+    rx = int(roi_size_mm / dx / 2)
+    ry = int(roi_size_mm / dy / 2)
+    rz = int(roi_size_mm / dz / 2) if dz > 0 else max(rx, ry)
+
+    saved = []
+
+    # — 轴位 (Z固定) —
+    x1, x2 = max(0, cvx - rx), min(nx, cvx + rx)
+    y1, y2 = max(0, cvy - ry), min(ny, cvy + ry)
+    z = max(0, min(nz - 1, cvz))
+    slab = hu_array[z, y1:y2, x1:x2]
+    gray = window_lung(slab)
+    img = Image.fromarray(gray, mode='L').resize((512, 512), Image.LANCZOS)
+    path = os.path.join(output_dir, f"{seriesuid}_nodule_{nodule_idx:03d}_axial.png")
+    img.save(path, format='PNG')
+    saved.append(path)
+
+    # — 冠状位 (Y固定) —
+    x1, x2 = max(0, cvx - rx), min(nx, cvx + rx)
+    z1, z2 = max(0, cvz - rz), min(nz, cvz + rz)
+    y = max(0, min(ny - 1, cvy))
+    slab = hu_array[z1:z2, y, x1:x2]
+    gray = window_lung(slab)
+    img = Image.fromarray(gray, mode='L').resize((512, 512), Image.LANCZOS)
+    path = os.path.join(output_dir, f"{seriesuid}_nodule_{nodule_idx:03d}_coronal.png")
+    img.save(path, format='PNG')
+    saved.append(path)
+
+    # — 矢状位 (X固定) —
+    y1, y2 = max(0, cvy - ry), min(ny, cvy + ry)
+    z1, z2 = max(0, cvz - rz), min(nz, cvz + rz)
+    x = max(0, min(nx - 1, cvx))
+    slab = hu_array[z1:z2, y1:y2, x]
+    gray = window_lung(slab)
+    img = Image.fromarray(gray, mode='L').resize((512, 512), Image.LANCZOS)
+    path = os.path.join(output_dir, f"{seriesuid}_nodule_{nodule_idx:03d}_sagittal.png")
+    img.save(path, format='PNG')
+    saved.append(path)
+
+    return saved
+
+
 def load_nodule_features(features_path: str) -> dict:
     """
     加载 nodule_features.json，按 seriesuid 分组。
@@ -187,8 +269,8 @@ def load_nodule_features(features_path: str) -> dict:
 
 def main():
     parser = argparse.ArgumentParser(description=".mhd → PNG 切片转换")
-    parser.add_argument("--mode", default="center", choices=["center", "nodule_slices"],
-                        help="center=中心切片 (原始), nodule_slices=结节多层切片 (新增)")
+    parser.add_argument("--mode", default="center", choices=["center", "nodule_slices", "multi_view"],
+                        help="center=中心切片, nodule_slices=轴向多层, multi_view=三平面(轴+冠+矢)")
     parser.add_argument("--images_dir", default="/root/autodl-tmp/data/LUNA16/images",
                         help=".mhd 文件目录")
     parser.add_argument("--output_dir", default="/root/autodl-tmp/data/LUNA16/images_png",
@@ -287,6 +369,54 @@ def main():
         print(f"\nDone: {total_nodules} 结节 → {total_slices} 张 PNG ({failed_nodules} 失败)")
         print(f"Output: {args.output_dir}/")
         print(f"总 PNG 文件数: {len([f for f in os.listdir(args.output_dir) if f.endswith('.png')])}")
+
+    elif args.mode == "multi_view":
+        # ── 多视图模式 (轴位+冠位+矢位) ──
+        if not os.path.exists(args.features):
+            print(f"[ERROR] nodule_features.json 不存在: {args.features}")
+            print("  请先运行: python data/lidc_match.py")
+            return
+
+        print(f"模式: multi_view (三平面: 轴位+冠状+矢状, 基于结节世界坐标)")
+        print(f"  加载特征: {args.features}")
+
+        nodules_by_uid = load_nodule_features(args.features)
+
+        mhd_map = {}
+        for root, dirs, files in os.walk(args.images_dir):
+            for f in files:
+                if f.endswith('.mhd'):
+                    uid = f.replace('.mhd', '')
+                    mhd_map[uid] = os.path.join(root, f)
+
+        valid_uids = set(mhd_map.keys()) & set(nodules_by_uid.keys())
+        print(f"  有 .mhd + 特征匹配的 CT 扫描: {len(valid_uids)}")
+
+        if args.max_scans > 0:
+            valid_uids = set(sorted(valid_uids)[:args.max_scans])
+
+        total_nodules, total_png, failed = 0, 0, 0
+        for seriesuid in tqdm(sorted(valid_uids), desc="mhd→png (multi_view)"):
+            mhd_path = mhd_map[seriesuid]
+            nodules = nodules_by_uid[seriesuid]
+            for ni, nodule in enumerate(nodules):
+                if args.max_nodules > 0 and total_nodules >= args.max_nodules:
+                    break
+                saved = extract_multi_view(
+                    mhd_path,
+                    nodule.get("coordX", 0),
+                    nodule.get("coordY", 0),
+                    nodule.get("coordZ", 0),
+                    args.output_dir, seriesuid, nodule_idx=ni,
+                )
+                if saved:
+                    total_nodules += 1
+                    total_png += len(saved)
+                else:
+                    failed += 1
+
+        print(f"\nDone: {total_nodules} 结节 → {total_png} 张 PNG ({failed} 失败)")
+        print(f"Output: {args.output_dir}/")
 
 
 if __name__ == "__main__":

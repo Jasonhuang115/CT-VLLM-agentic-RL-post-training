@@ -925,3 +925,41 @@ ReST 首次运行无 adapter 时自动添加新 LoRA。
 3. 构建 DPO 数据 (`dpo_dataset_builder.py --sft_data sft_nohint`)
 4. ReST Round 1 → Round 2 → DPO → GRPO
 5. CT-RATE reward model 训练（未来工作）
+
+---
+
+## 二十二、512px PNG 重建 + BF16 ViT 解冻最终跑通 — 2026-07-11
+
+### mhd_to_png 输出 84px → 模型看不清
+
+**现象**: 训练 loss=298 (BF16 + ViT 解冻)，有图/无图输出不同但内容是"一般来说...通常..."教科书式泛泛描述，从不提具体结节特征。
+
+**诊断**: 每张 PNG 只有 84x84 像素。Qwen2.5-VL ViT patch_size=14, 84/14=6, 每图仅 36 个视觉 token。3 张切片 = 108 token，模型完全看不清。
+
+**根因**: `mhd_to_png.py` 用 50mm ROI 在 ~0.7mm/pixel CT 上裁剪 ≈ 71px，存 PNG 时未做 resize。
+
+**修复**: `mhd_to_png.py` 两处 `Image.fromarray` 后加 `img.resize((512,512), Image.LANCZOS)`。
+512px → ~1344 视觉 token/图 (x3 层 = 4032 token)。
+
+**修复后效果**:
+
+| 指标 | 84px (旧) | 512px (新) |
+|------|-----------|-----------|
+| 每图视觉 token | 36 | ~1344 |
+| Epoch 1 loss | 298 | **9.5** |
+
+**教训**: VLM 训练前必须检查输入图像尺寸，建议 ≥ 512px。
+
+### 4-bit 下 ViT 假解冻确认
+
+验证 `stage1_multislice_v1` 和 `stage1_vision_v1` adapter：ViT LoRA keys=0，视觉完全冻结。
+`unfreeze_vision_p2()` 的 dtype 检查在 4-bit (uint8) 下静默跳过所有视觉参数。
+**`--no_4bit` 必须加。**
+
+### 文件改动
+
+| 文件 | 改动 |
+|------|------|
+| `data/mhd_to_png.py` | 两处加 `img.resize((512,512), Image.LANCZOS)` |
+| `training/stage1_sft.py` | 已有 `--no_4bit, --unfreeze_vit_layers, --vit_lr_ratio` |
+

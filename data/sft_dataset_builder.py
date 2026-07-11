@@ -447,16 +447,24 @@ def main():
         # ── 图像查找（多切片优先）──
         import glob as _glob
         if args.slices_per_nodule > 1:
-            # 多切片模式: {seriesuid}_nodule_*_slice_*.png
-            png_pattern = os.path.join(png_dir, f"{suid}_nodule_*_slice_*.png")
-            png_candidates = sorted(_glob.glob(png_pattern))
-            if png_candidates:
-                # 取前 N 张切片
-                image_paths = png_candidates[:args.slices_per_nodule]
+            # 多视图模式优先: {seriesuid}_nodule_*_{axial|coronal|sagittal}.png
+            mv_pattern = os.path.join(png_dir, f"{suid}_nodule_*_axial.png")
+            mv_candidates = sorted(_glob.glob(mv_pattern))
+            if mv_candidates:
+                # 找到所有该结节的多视图文件 (axial + coronal + sagittal)
+                prefix = mv_candidates[0].replace("_axial.png", "")
+                all_views = sorted(_glob.glob(prefix + "_*.png"))
+                image_paths = all_views[:args.slices_per_nodule * 3]
             else:
-                # fallback: 旧格式 {seriesuid}_slice_*.png
-                alt_pattern = os.path.join(png_dir, f"{suid}_slice_*.png")
-                image_paths = sorted(_glob.glob(alt_pattern))[:args.slices_per_nodule]
+                # fallback 1: 多切片模式 {seriesuid}_nodule_*_slice_*.png
+                png_pattern = os.path.join(png_dir, f"{suid}_nodule_*_slice_*.png")
+                png_candidates = sorted(_glob.glob(png_pattern))
+                if png_candidates:
+                    image_paths = png_candidates[:args.slices_per_nodule]
+                else:
+                    # fallback 2: 旧格式 {seriesuid}_slice_*.png
+                    alt_pattern = os.path.join(png_dir, f"{suid}_slice_*.png")
+                    image_paths = sorted(_glob.glob(alt_pattern))[:args.slices_per_nodule]
         else:
             image_paths = []
 

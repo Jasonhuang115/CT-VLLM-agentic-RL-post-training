@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>CT Nodule Assistant</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="sidebar">
+        <div class="brand">
+          <h1>CT Nodule Assistant</h1>
+          <p>上传 CT 体积，输入结节世界坐标，生成锁参 ROI 与 VLM 报告。</p>
+        </div>
+
+        <label class="field">
+          <span>CT 文件</span>
+          <input id="ctFiles" type="file" multiple accept=".nii,.gz,.mhd,.raw,.nrrd,.zip" />
+        </label>
+
+        <div class="grid-3">
+          <label class="field">
+            <span>X mm</span>
+            <input id="coordX" type="number" step="0.01" placeholder="12.3" />
+          </label>
+          <label class="field">
+            <span>Y mm</span>
+            <input id="coordY" type="number" step="0.01" placeholder="-45.2" />
+          </label>
+          <label class="field">
+            <span>Z mm</span>
+            <input id="coordZ" type="number" step="0.01" placeholder="-120.5" />
+          </label>
+        </div>
+
+        <div class="grid-2">
+          <label class="field">
+            <span>直径 mm</span>
+            <input id="diameter" type="number" step="0.1" placeholder="可选" />
+          </label>
+          <label class="field">
+            <span>年龄</span>
+            <input id="age" type="number" step="1" placeholder="可选" />
+          </label>
+        </div>
+
+        <label class="field">
+          <span>吸烟史</span>
+          <select id="smoking">
+            <option value="">未提供</option>
+            <option value="never">从不吸烟</option>
+            <option value="former">既往吸烟</option>
+            <option value="current">当前吸烟</option>
+          </select>
+        </label>
+
+        <label class="check">
+          <input id="useTools" type="checkbox" checked />
+          <span>调用指南 / Lung-RADS / Tavily 工具</span>
+        </label>
+
+        <div class="actions">
+          <button id="detectBtn" type="button" class="secondary">自动检测</button>
+          <button id="analyzeBtn" type="button">分析</button>
+        </div>
+
+        <div id="status" class="status">等待输入</div>
+      </section>
+
+      <section class="chat">
+        <div id="messages" class="messages">
+          <article class="message assistant">
+            <div class="bubble">
+              <strong>系统</strong>
+              <p>第一版以手动世界坐标为主。ROI 输出固定为 512px、肺窗、50mm、LANCZOS。</p>
+            </div>
+          </article>
+        </div>
+
+        <form id="chatForm" class="composer">
+          <textarea id="message" rows="2" placeholder="例如：请分析这个肺结节，并说明随访建议。">请分析这个肺结节，并说明随访建议。</textarea>
+          <button type="submit">发送</button>
+        </form>
+      </section>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

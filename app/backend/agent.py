@@ -72,14 +72,25 @@ class AnalysisAgent:
         guideline = self.tools.execute("guideline_retrieval", {"query": guideline_query})
         calls.append(self._tool_call("guideline_retrieval", {"query": guideline_query}, guideline))
 
-        if coord.diameter_mm:
+        # Lung-RADS: 总是调用（有直径时精确分级，无直径时至少提供分类框架）
+        diam = coord.diameter_mm
+        if diam:
             calc_input = {
                 "function": "lung_rads_classify",
                 "nodule_type": "solid",
-                "size_mm": coord.diameter_mm,
+                "size_mm": diam,
+                "is_baseline": True,
+            }
+            # 也尝试非实性分类，让模型参考多个结果
+            calc_ggo_input = {
+                "function": "lung_rads_classify",
+                "nodule_type": "ground_glass",
+                "size_mm": diam,
                 "is_baseline": True,
             }
             calc = self.tools.execute("lung_rads_calculator", calc_input)
+            calc_ggo = self.tools.execute("lung_rads_calculator", calc_ggo_input)
+            calc["ground_glass_classification"] = calc_ggo
             calls.append(self._tool_call("lung_rads_calculator", calc_input, calc))
 
         lower = user_message.lower()

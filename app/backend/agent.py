@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, AsyncIterator
 
 from app.backend.model_client import VLMClient
 from app.backend.schemas import ClinicalInfo, NoduleCoord, ToolCall
@@ -38,6 +38,32 @@ class AnalysisAgent:
             user_message=user_message,
         )
         return report, tool_calls
+
+    async def analyze_nodule_stream(
+        self,
+        roi_paths,
+        coord: NoduleCoord,
+        clinical_info: ClinicalInfo | None,
+        history: list[dict[str, str]],
+        user_message: str,
+        use_tools: bool = True,
+    ) -> tuple[AsyncIterator[str], list[ToolCall]]:
+        """流式版：返回 (text_stream, tool_calls)。"""
+        tool_calls: list[ToolCall] = []
+        if use_tools:
+            tool_calls = self._run_tools(coord, clinical_info, user_message)
+
+        tools_context: list[dict[str, Any]] = [
+            {"name": call.name, "input": call.input, "output": call.output} for call in tool_calls
+        ]
+        stream = self.model_client.diagnose_stream(
+            roi_paths=roi_paths,
+            clinical_info=clinical_info,
+            tools_context=tools_context,
+            history=history,
+            user_message=user_message,
+        )
+        return stream, tool_calls
 
     def _run_tools(self, coord: NoduleCoord, clinical_info: ClinicalInfo | None, user_message: str) -> list[ToolCall]:
         calls: list[ToolCall] = []

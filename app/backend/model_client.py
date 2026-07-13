@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import json
 from pathlib import Path
 from typing import Any
 
@@ -10,7 +11,7 @@ import httpx
 
 from app.backend.config import Settings
 from app.backend.compat import model_to_dict
-from app.backend.constants import DISCLAIMER, VLM_PROMPT
+from app.backend.constants import DISCLAIMER, FOLLOWUP_PROMPT, VLM_PROMPT
 from app.backend.schemas import ClinicalInfo
 
 
@@ -23,6 +24,38 @@ class VLMClient:
     def __init__(self, settings: Settings):
         self.settings = settings
 
+    def _build_messages(
+        self,
+        roi_paths: dict[str, Path],
+        clinical_info: ClinicalInfo | None,
+        tools_context: list[dict[str, Any]] | None,
+        history: list[dict[str, str]] | None,
+        user_message: str | None,
+    ) -> list[dict[str, Any]]:
+        """构建发送给 VLM 的 messages。多轮追问时用简练 prompt。"""
+        content: list[dict[str, Any]] = []
+        for view in ("axial", "coronal", "sagittal"):
+            content.append({"type": "image_url", "image_url": {"url": _image_data_url(roi_paths[view])}})
+
+        is_followup = bool(history and len(history) >= 2)
+        prompt = FOLLOWUP_PROMPT if is_followup else VLM_PROMPT
+        extra = self._build_extra_context(clinical_info, tools_context, history, user_message)
+        if extra:
+            prompt = f"{prompt}\n\n{extra}"
+        content.append({"type": "text", "text": prompt})
+
+        system_text = (
+            "你是一名谨慎的胸部影像 AI 助手。如果用户追问，请基于之前的分析直接回答，不要重复完整报告。"
+            if is_followup else
+            "你是一名谨慎的胸部影像 AI 助手。基于给定的结节 ROI 多视图图像生成报告。"
+            "不要声称确诊，必须说明不确定性和需要医生结合原始影像确认。"
+        )
+
+        return [
+            {"role": "system", "content": system_text},
+            {"role": "user", "content": content},
+        ]
+
     async def diagnose(
         self,
         roi_paths: dict[str, Path],
@@ -34,26 +67,7 @@ class VLMClient:
         if self.settings.vlm_mock:
             return self._mock_report(clinical_info, tools_context)
 
-        content: list[dict[str, Any]] = []
-        for view in ("axial", "coronal", "sagittal"):
-            content.append({"type": "image_url", "image_url": {"url": _image_data_url(roi_paths[view])}})
-
-        prompt = VLM_PROMPT
-        extra = self._build_extra_context(clinical_info, tools_context, history, user_message)
-        if extra:
-            prompt = f"{prompt}\n\n{extra}"
-        content.append({"type": "text", "text": prompt})
-
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "你是一名谨慎的胸部影像 AI 助手。基于给定的结节 ROI 多视图图像生成报告。"
-                    "不要声称确诊，必须说明不确定性和需要医生结合原始影像确认。"
-                ),
-            },
-            {"role": "user", "content": content},
-        ]
+        messages = self._build_messages(roi_paths, clinical_info, tools_context, history, user_message)
 
         payload = {
             "model": self.settings.vlm_model,
@@ -75,6 +89,50 @@ class VLMClient:
             return data["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
             raise RuntimeError(f"VLM 返回格式异常: {data}") from exc
+
+    async def diagnose_stream(
+        self,
+        roi_paths: dict[str, Path],
+        clinical_info: ClinicalInfo | None = None,
+        tools_context: list[dict[str, Any]] | None = None,
+        history: list[dict[str, str]] | None = None,
+        user_message: str | None = None,
+    ):
+        """流式诊断，yield 文本片段。"""
+        if self.settings.vlm_mock:
+            for chunk in self._mock_report(clinical_info, tools_context).split():
+                yield chunk + " "
+            return
+
+        messages = self._build_messages(roi_paths, clinical_info, tools_context, history, user_message)
+
+        payload = {
+            "model": self.settings.vlm_model,
+            "messages": messages,
+            "temperature": self.settings.vlm_temperature,
+            "max_tokens": self.settings.vlm_max_tokens,
+            "stream": True,
+        }
+        headers = {}
+        if self.settings.vlm_api_key:
+            headers["Authorization"] = f"Bearer {self.settings.vlm_api_key}"
+
+        url = self.settings.vlm_api_base.rstrip("/") + "/chat/completions"
+        async with httpx.AsyncClient(timeout=self.settings.vlm_timeout_seconds) as client:
+            async with client.stream("POST", url, json=payload, headers=headers) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if line.startswith("data: "):
+                        data_str = line[6:]
+                        if data_str == "[DONE]":
+                            return
+                        try:
+                            chunk = json.loads(data_str)
+                            delta = chunk.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                            if delta:
+                                yield delta
+                        except json.JSONDecodeError:
+                            continue
 
     def _build_extra_context(
         self,

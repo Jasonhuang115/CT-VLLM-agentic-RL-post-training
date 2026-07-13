@@ -9,7 +9,7 @@ from typing import Annotated
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.backend.agent import AnalysisAgent
@@ -53,6 +53,9 @@ store = SessionStore(max_turns=settings.max_history_turns)
 detector = Detector(settings)
 tools = ToolRegistry()
 agent = AnalysisAgent(VLMClient(settings), tools)
+
+# 多轮对话：缓存每个 session 的 CT 路径，避免重复上传
+_session_ct_cache: dict[str, Path] = {}
 
 
 @app.get("/")
@@ -106,26 +109,24 @@ def _history_for_model(session_id: str) -> list[dict[str, str]]:
 
 @app.post("/detect", response_model=list[DetectResponseItem])
 async def detect(
-    ct_files: Annotated[list[UploadFile], File(description="CT volume: .nii/.nii.gz/.mhd+.raw or DICOM zip")],
+    ct_files: Annotated[list[UploadFile], File(description="CT volume")] = [],
+    session_id: Annotated[str | None, Form()] = None,
 ):
-    case_dir, saved_files = await save_upload_files(ct_files, settings.upload_dir, settings.max_upload_mb)
-    ct_path = resolve_ct_input(case_dir, saved_files)
+    _, case_dir, ct_path = await _resolve_ct_and_session(ct_files, session_id)
     detections = detector.detect(ct_path)
     return [DetectResponseItem(**model_to_dict(d)) for d in detections]
 
 
 @app.post("/analyze", response_model=AnalyzeResponse)
 async def analyze(
-    ct_files: Annotated[list[UploadFile], File(description="CT volume: .nii/.nii.gz/.mhd+.raw or DICOM zip")],
+    ct_files: Annotated[list[UploadFile], File(description="CT volume，首轮必传")] = [],
     nodule_coords: Annotated[str | None, Form(description="JSON object or list with x/y/z world coordinates")] = None,
     clinical_info: Annotated[str | None, Form(description="Optional JSON clinical info")] = None,
     message: Annotated[str, Form()] = "请分析这个肺结节。",
     session_id: Annotated[str | None, Form()] = None,
     use_tools: Annotated[bool, Form()] = True,
 ):
-    sid = store.create_or_get(session_id)
-    case_dir, saved_files = await save_upload_files(ct_files, settings.upload_dir, settings.max_upload_mb)
-    ct_path = resolve_ct_input(case_dir, saved_files)
+    sid, case_dir, ct_path = await _resolve_ct_and_session(ct_files, session_id)
     coords = _parse_coords(nodule_coords)
     clinical = _parse_clinical_info(clinical_info)
 
@@ -167,6 +168,97 @@ async def analyze(
         )
 
     return AnalyzeResponse(session_id=sid, results=results, disclaimer=DISCLAIMER)
+
+
+async def _resolve_ct_and_session(
+    ct_files: list[UploadFile],
+    session_id: str | None,
+) -> tuple[str, Path, Path]:
+    """解析 CT 文件。支持多轮：首轮上传，后续复用缓存。返回 (sid, case_dir, ct_path)。"""
+    sid = store.create_or_get(session_id)
+    has_files = any(f.filename and f.size for f in ct_files)
+
+    if has_files:
+        case_dir, saved_files = await save_upload_files(ct_files, settings.upload_dir, settings.max_upload_mb)
+        ct_path = resolve_ct_input(case_dir, saved_files)
+        _session_ct_cache[sid] = ct_path
+        return sid, case_dir, ct_path
+
+    if sid not in _session_ct_cache:
+        raise HTTPException(status_code=400, detail="首轮对话请先上传 CT 文件。")
+    ct_path = _session_ct_cache[sid]
+    case_dir = ct_path.parent
+    return sid, case_dir, ct_path
+
+
+@app.post("/analyze/stream")
+async def analyze_stream(
+    ct_files: Annotated[list[UploadFile], File(description="CT volume，首轮必传")] = [],
+    nodule_coords: Annotated[str | None, Form(description="JSON world coordinates")] = None,
+    clinical_info: Annotated[str | None, Form(description="Optional JSON clinical info")] = None,
+    message: Annotated[str, Form()] = "请分析这个肺结节。",
+    session_id: Annotated[str | None, Form()] = None,
+    use_tools: Annotated[bool, Form()] = True,
+):
+    sid, case_dir, ct_path = await _resolve_ct_and_session(ct_files, session_id)
+    coords = _parse_coords(nodule_coords)
+    clinical = _parse_clinical_info(clinical_info)
+
+    if not coords:
+        coords = detector.detect(ct_path)
+        if not coords:
+            # 多轮对话：复用历史坐标
+            for m in reversed(store.get(sid)):
+                if m.metadata.get("coords"):
+                    coords = [NoduleCoord(**c) for c in m.metadata["coords"]]
+                    break
+
+    store.append(sid, "user", message, {"coords": [model_to_dict(c) for c in coords] if coords else []})
+
+    async def _event_stream():
+        all_images: dict[int, dict] = {}
+        all_tool_calls: dict[int, list] = {}
+        full_text = ""
+        last_text = ""
+        coords_list = coords or []
+
+        for idx, coord in enumerate(coords_list, start=1):
+            yield f"data: {json.dumps({'type': 'status', 'text': f'正在生成 ROI (结节 {idx}/{len(coords_list)})...'}, ensure_ascii=False)}\n\n"
+
+            roi_dir = case_dir / "roi"
+            roi = extract_locked_roi(
+                ct_path=ct_path,
+                coord=coord,
+                output_dir=roi_dir,
+                nodule_idx=idx,
+                seriesuid=case_dir.name,
+            )
+
+            yield f"data: {json.dumps({'type': 'status', 'text': '正在调用辅助工具...'}, ensure_ascii=False)}\n\n"
+
+            text_stream, tool_calls = await agent.analyze_nodule_stream(
+                roi_paths=roi.paths,
+                coord=coord,
+                clinical_info=clinical,
+                history=_history_for_model(sid),
+                user_message=message,
+                use_tools=use_tools,
+            )
+
+            yield f"data: {json.dumps({'type': 'status', 'text': 'VLM 正在生成报告...'}, ensure_ascii=False)}\n\n"
+
+            async for token in text_stream:
+                full_text += token
+                yield f"data: {json.dumps({'type': 'token', 'text': token}, ensure_ascii=False)}\n\n"
+
+            last_text = full_text
+            store.append(sid, "assistant", last_text, {"nodule_id": idx})
+            all_images[idx] = roi.images_base64
+            all_tool_calls[idx] = [model_to_dict(t) for t in tool_calls]
+
+        yield f"data: {json.dumps({'type': 'done', 'session_id': sid, 'report': last_text, 'images': all_images, 'tool_calls': all_tool_calls, 'disclaimer': DISCLAIMER}, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(_event_stream(), media_type="text/event-stream")
 
 
 @app.get("/api/sessions/{session_id}")

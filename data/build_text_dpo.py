@@ -80,7 +80,7 @@ def call_ds(client, system, prompt, temp=0.7):
                 model="deepseek-chat",
                 messages=[{"role": "system", "content": system},
                           {"role": "user", "content": prompt}],
-                temperature=temp, max_tokens=600)
+                temperature=temp, max_tokens=1200)
             return resp.choices[0].message.content
         except Exception as e:
             print(f"  API retry {attempt+1}: {e}")
@@ -125,7 +125,7 @@ def main():
     style_examples = []
     if os.path.exists(os.path.expanduser(args.ctrate_reports)):
         style_examples = load_ctrate_impressions(
-            os.path.expanduser(args.ctrate_reports), n=5)
+            os.path.expanduser(args.ctrate_reports), n=15)
         print(f"[INFO] CT-RATE 示例: {len(style_examples)} 条")
 
     pairs = []
@@ -147,10 +147,10 @@ def main():
 {style_text}
 
 要求:
-- 中文书写，2-3段即可
-- 基于特征给出明确的恶性推断（不要"可能...也可能..."）
-- 随访建议与恶性评估严重度匹配
-- 不写模板式标题（不要"一、影像学发现"这类章节标题）
+- 中文书写，300-500字
+- 包含: 对结节特征的诊断解读、良恶性推断及依据、具体的随访或处理建议
+- 自然段落格式，不做模板式罗列，不使用"一、二、"等序号章节标题
+- 有明确的特征→风险推理链（如"结节大于8mm且边缘模糊，短期随访可能遗漏进展 → 建议3个月CT复查"）
 - 不要重复上述影像学发现的具体描述，直接给诊断意见"""
 
             chosen = call_ds(client,

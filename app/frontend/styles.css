@@ -180,9 +180,20 @@ button.secondary:hover {
   background: var(--soft);
 }
 
+/* 流式输出闪烁光标 */
+.bubble.streaming::after {
+  content: "▊";
+  animation: blink 1s step-end infinite;
+  color: var(--accent);
+}
+
+@keyframes blink {
+  50% { opacity: 0; }
+}
+
 .roi-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
   gap: 10px;
   margin: 12px 0;
 }
@@ -193,6 +204,11 @@ button.secondary:hover {
   border-radius: 8px;
   overflow: hidden;
   background: #111;
+  cursor: pointer;
+}
+
+.roi-grid figure:hover img {
+  opacity: 0.85;
 }
 
 .roi-grid img {
@@ -206,6 +222,45 @@ button.secondary:hover {
   padding: 6px 8px;
   background: #fff;
   color: var(--muted);
+  font-size: 12px;
+}
+
+/* 图片灯箱 */
+.lightbox {
+  display: none;
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  background: rgba(0,0,0,0.92);
+  align-items: center;
+  justify-content: center;
+}
+.lightbox.open {
+  display: flex;
+}
+.lightbox img {
+  max-width: 95vw;
+  max-height: 95vh;
+  object-fit: contain;
+  border-radius: 4px;
+}
+.lightbox .close {
+  position: absolute;
+  top: 20px;
+  right: 30px;
+  color: #fff;
+  font-size: 40px;
+  cursor: pointer;
+  opacity: 0.7;
+}
+.lightbox .close:hover {
+  opacity: 1;
+}
+
+/* CT 已缓存提示 */
+.field.has-cache::after {
+  content: "✅ 已上传";
+  color: #22863a;
   font-size: 12px;
 }
 

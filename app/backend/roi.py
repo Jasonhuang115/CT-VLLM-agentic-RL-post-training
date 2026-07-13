@@ -37,10 +37,27 @@ def window_lung(hu_slice: np.ndarray) -> np.ndarray:
     return (normalized * 255).astype(np.uint8)
 
 
-def _resize_and_save(slab: np.ndarray, out_path: Path) -> None:
+def _resize_and_save(slab: np.ndarray, out_path: Path, mark_center: bool = False) -> None:
     gray = window_lung(slab)
     image = Image.fromarray(gray, mode=PNG_MODE)
     image = image.resize((OUTPUT_SIZE_PX, OUTPUT_SIZE_PX), Image.Resampling.LANCZOS)
+
+    if mark_center:
+        from PIL import ImageDraw
+        draw = ImageDraw.Draw(image)
+        cx, cy = OUTPUT_SIZE_PX // 2, OUTPUT_SIZE_PX // 2
+        r = 12
+        # 外黑圈
+        draw.ellipse([cx - r - 2, cy - r - 2, cx + r + 2, cy + r + 2], outline=0, width=2)
+        # 内白圈
+        draw.ellipse([cx - r, cy - r, cx + r, cy + r], outline=255, width=1)
+        # 十字
+        gap = 5
+        draw.line([cx - r - 8, cy, cx - gap, cy], fill=255, width=1)
+        draw.line([cx + gap, cy, cx + r + 8, cy], fill=255, width=1)
+        draw.line([cx, cy - r - 8, cx, cy - gap], fill=255, width=1)
+        draw.line([cx, cy + gap, cx, cy + r + 8], fill=255, width=1)
+
     image.save(out_path, format="PNG")
 
 
@@ -114,9 +131,9 @@ def extract_locked_roi(
     y1, y2 = _clamp(iy - ry, 0, ny), _clamp(iy + ry, 0, ny)
     z1, z2 = _clamp(iz - rz, 0, nz), _clamp(iz + rz, 0, nz)
 
-    _resize_and_save(volume_hu[iz, y1:y2, x1:x2], paths["axial"])
-    _resize_and_save(volume_hu[z1:z2, iy, x1:x2], paths["coronal"])
-    _resize_and_save(volume_hu[z1:z2, y1:y2, ix], paths["sagittal"])
+    _resize_and_save(volume_hu[iz, y1:y2, x1:x2], paths["axial"], mark_center=True)
+    _resize_and_save(volume_hu[z1:z2, iy, x1:x2], paths["coronal"], mark_center=True)
+    _resize_and_save(volume_hu[z1:z2, y1:y2, ix], paths["sagittal"], mark_center=True)
 
     return ROIResult(
         paths=paths,

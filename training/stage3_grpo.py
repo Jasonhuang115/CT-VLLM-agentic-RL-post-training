@@ -101,9 +101,8 @@ def generate_g_responses(model, tok, prompt_text, img_paths, device,
     return completions, prompt_text, img_paths
 
 
-@torch.no_grad()
 def compute_log_prob(model, tok, prompt_msgs, completion_text, img_paths, device):
-    """计算 completion 在给定 prompt+image 下的 log-prob (sum)"""
+    """计算 completion 在给定 prompt+image 下的 log-prob (sum). 保持 grad 以支持反向传播。"""
     assistant_msg = {"role": "assistant",
                      "content": [{"type": "text", "text": completion_text}]}
     full_msgs = prompt_msgs + [assistant_msg]
@@ -185,24 +184,12 @@ def main():
     trainable = [p for p in model.parameters() if p.requires_grad]
     print(f"[MODEL] Trainable: {sum(p.numel() for p in trainable):,}")
 
-    # ── 3. Load reference model (frozen) ──
-    print(f"[MODEL] Loading reference model (frozen) …")
-    ref_model, _ = FastVisionModel.from_pretrained(
-        args.model_path, load_in_4bit=use_4bit,
-        use_gradient_checkpointing="unsloth")
-    if os.path.exists(args.adapter):
-        ref_model = PeftModel.from_pretrained(ref_model, args.adapter)
-    ref_model.eval()
-    for p in ref_model.parameters():
-        p.requires_grad = False
-    print(f"[MODEL] Reference model frozen")
-
-    # ── 4. Optimizer ──
+    # ── 3. Optimizer ── (no ref model, use L2 reg instead of KL)
     steps_per_epoch = max(len(ds) // (args.grad_accum * args.n_generations), 1)
     total_steps = steps_per_epoch * args.epochs
     opt = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=0.01)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=total_steps)
-    print(f"[TRAIN] ~{steps_per_epoch} steps/epoch, {total_steps} total\n")
+    print(f"[TRAIN] ~{steps_per_epoch} steps/epoch, {total_steps} total (no ref model)\n")
 
     global_step = 0
 
@@ -256,18 +243,11 @@ def main():
                     log_p = compute_log_prob(model, tok, user_msgs, completion,
                                               img_paths, device)
 
-                    # Log-prob under reference (frozen) model
-                    log_p_ref = compute_log_prob(ref_model, tok, user_msgs,
-                                                  completion, img_paths, device)
-
-                    # (e) GRPO loss = PG + KL penalty
+                    # (e) GRPO loss = PG + L2 regularization
                     pg_loss = -adv * log_p
+                    l2_penalty = 0.001 * (log_p ** 2).mean()
 
-                    # KL(π_θ || π_ref) unbiased estimator (DeepSeek k1)
-                    log_ratio = log_p_ref - log_p
-                    kl = torch.exp(log_ratio) - log_ratio - 1.0
-
-                    group_losses.append(pg_loss + args.kl_beta * kl)
+                    group_losses.append(pg_loss + l2_penalty)
                     group_rewards.append(rewards[gi].item())
 
             if not group_losses:

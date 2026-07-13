@@ -53,3 +53,6 @@ lightning_logs/
 
 # AutoDL
 autodl-tmp/
+app/uploads/
+test_nodules.json
+doc/

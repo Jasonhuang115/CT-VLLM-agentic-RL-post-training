@@ -1,6 +1,6 @@
-# 肺结节CT多模态后训练项目 — Agentic RL
+# 肺结节CT多模态后训练项目
 
-> 完整后训练管线: SFT → DPO/SimPO → GRPO → Agentic RL
+> 完整后训练管线: SFT → DPO/SimPO → GRPO 
 > 基座模型: Qwen2.5-VL-3B-Instruct | 训练框架: Unsloth + TRL
 > GPU: RTX 5090 32GB | 费用: ~¥150-200 | 时间: 3-5天
 
